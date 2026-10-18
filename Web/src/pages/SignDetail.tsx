@@ -25,6 +25,7 @@ import config from '../../config.yaml';
 import { GestureInput } from '../components/sign/GestureInput';
 import { PinInput } from '../components/sign/PinInput';
 import { LocationInput } from '../components/sign/LocationInput';
+import { MapPicker } from '../components/sign/MapPicker';
 import { QrInput } from '../components/sign/QrInput';
 import { NormalInput } from '../components/sign/NormalInput';
 import { PhotoInput } from '../components/sign/PhotoInput';
@@ -87,7 +88,9 @@ const SignDetail = () => {
   const [lat, setLat] = useState('');
   const [lng, setLng] = useState('');
   const [locationStr, setLocationStr] = useState('');
+  const [locationName, setLocationName] = useState('');
   const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
+  const [isMapPickerOpen, setIsMapPickerOpen] = useState(false);
   const [photoFiles, setPhotoFiles] = useState<File[]>([]);
   const [photoPreviewUrls, setPhotoPreviewUrls] = useState<string[]>([]);
   
@@ -513,7 +516,7 @@ const SignDetail = () => {
           <div className="p-5 pb-4">
             {activity.sign_type === 3 && <GestureInput value={signCode} onChange={setSignCode} />}
             {activity.sign_type === 5 && <PinInput value={signCode} onChange={setSignCode} />}
-            {activity.sign_type === 4 && <LocationInput name={LOCATION_PRESETS.find((p: any) => p.lat === lat)?.name || ''} description={locationStr} onOpen={() => setIsLocationPickerOpen(true)} />}
+            {activity.sign_type === 4 && <LocationInput name={locationName || LOCATION_PRESETS.find((p: any) => p.lat === lat)?.name || ''} description={locationStr} onOpen={() => setIsLocationPickerOpen(true)} />}
             {activity.sign_type === 2 && <QrInput />}
             {isPhotoSign && (
               <PhotoInput 
@@ -595,10 +598,18 @@ const SignDetail = () => {
             <motion.div initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }} transition={{ type: 'spring', damping: 28, stiffness: 250 }} className="bg-white w-full max-w-[480px] rounded-t-[3rem] p-8 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]" onClick={(e) => e.stopPropagation()}>
               <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-8 shrink-0" />
               <div className="flex items-center justify-between mb-6 shrink-0"><h3 className="text-xl font-bold text-slate-900">选择签到位置</h3><button onClick={() => setIsLocationPickerOpen(false)} className="w-8 h-8 flex items-center justify-center bg-slate-100 text-slate-400 rounded-full">✕</button></div>
+              <button
+                type="button"
+                onClick={() => setIsMapPickerOpen(true)}
+                className="w-full mb-4 py-3 rounded-2xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-600/20 active:scale-[0.98] transition-transform shrink-0"
+              >
+                <MapPin size={18} />
+                高德地图选点
+              </button>
               <div className="flex-1 overflow-y-auto space-y-3 pr-1 pb-[calc(40px+var(--sab))] custom-scrollbar px-1">{LOCATION_PRESETS.map((p: any, i: number) => {
                 const isSelected = p.lat === lat && p.lng === lng;
                 return (
-                  <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { setLat(p.lat); setLng(p.lng); setLocationStr(p.description); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
+                  <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { setLat(p.lat); setLng(p.lng); setLocationName(p.name); setLocationStr(p.description); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
                     <div className="flex-1 min-w-0 pr-4"><div className="font-bold text-slate-800 mb-0.5 text-sm">{p.name}</div><div className="text-[10px] text-slate-400 font-medium truncate">{p.description}</div></div>
                     {isSelected && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
                   </motion.div>
@@ -623,6 +634,25 @@ const SignDetail = () => {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <MapPicker
+        open={isMapPickerOpen}
+        initialLng={lng}
+        initialLat={lat}
+        initialName={locationName}
+        initialDescription={locationStr}
+        onClose={() => setIsMapPickerOpen(false)}
+        onConfirm={(result) => {
+          setLat(result.lat);
+          setLng(result.lng);
+          setLocationName(result.name);
+          setLocationStr(result.description);
+          setIsMapPickerOpen(false);
+          setIsLocationPickerOpen(false);
+          toast.success('已选择地图位置');
+        }}
+      />
+
       <style>{`.custom-scrollbar::-webkit-scrollbar { width: 0px; }`}</style>
     </div>
   );
