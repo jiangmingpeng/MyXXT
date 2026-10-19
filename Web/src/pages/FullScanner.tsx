@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronLeft, Camera, EyeOff, Eye, MapPin, CheckCircle2 } from 'lucide-react';
+import { ChevronLeft, Camera, EyeOff, Eye, MapPin, CheckCircle2, ImagePlus, Loader2 } from 'lucide-react';
 import { Html5Qrcode, type CameraDevice } from 'html5-qrcode';
 import toast from 'react-hot-toast';
 import client from '../api/client';
@@ -42,6 +42,26 @@ const getFriendlyCameraLabel = (camera: CameraDevice, index: number) => {
   return `摄像头 ${index + 1}`;
 };
 
+// 懒加载 zxing-wasm（原生 ZXing 的 WASM 版本），仅在“从相册导入”时加载。
+// wasm 通过 Vite 的 ?url 自托管，避免运行时依赖 jsdelivr CDN。
+let zxingReaderPromise: Promise<typeof import('zxing-wasm/reader')> | null = null;
+const getZxingReader = () => {
+  if (!zxingReaderPromise) {
+    zxingReaderPromise = (async () => {
+      const [reader, wasm] = await Promise.all([
+        import('zxing-wasm/reader'),
+        import('zxing-wasm/reader/zxing_reader.wasm?url'),
+      ]);
+      reader.prepareZXingModule({ overrides: { locateFile: () => wasm.default } });
+      return reader;
+    })().catch((err) => {
+      zxingReaderPromise = null;
+      throw err;
+    });
+  }
+  return zxingReaderPromise;
+};
+
 const FullScanner = () => {
   const navigate = useNavigate();
   const location = useLocation();
@@ -57,9 +77,11 @@ const FullScanner = () => {
   const [isStealthMode, setIsStealthMode] = useState(false);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [showLoadingOverlay, setShowLoadingOverlay] = useState(true);
+  // 相机不可用/启动失败时的兜底状态：提前关闭加载遮罩，露出「相册」导入入口
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isCameraReady) {
+    if (isCameraReady || cameraError) {
       const timer = setTimeout(() => {
         setShowLoadingOverlay(false);
       }, 5);
@@ -67,7 +89,7 @@ const FullScanner = () => {
     } else {
       setShowLoadingOverlay(true);
     }
-  }, [isCameraReady]);
+  }, [isCameraReady, cameraError]);
 
   const [lat, setLat] = useState('');
   const [lng, setLng] = useState('');
@@ -78,6 +100,11 @@ const FullScanner = () => {
   const lngRef = useRef('');
   const locationStrRef = useRef('');
   const lastScanTimeRef = useRef<number>(0);
+  const lastScanDetectedRef = useRef<number>(0);
+  const lastScanFailToastRef = useRef<number>(0);
+  const scanStartTimeRef = useRef<number>(Date.now());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [isDecodingImage, setIsDecodingImage] = useState(false);
 
   useEffect(() => {
     latRef.current = lat;
@@ -270,8 +297,13 @@ const FullScanner = () => {
           /back|rear|environment|后置|后面|背面/.test(d.label.toLowerCase())
         );
         setSelectedDeviceId(backCamera ? backCamera.id : (normalizedDevices.length > 1 ? normalizedDevices[1].id : normalizedDevices[0].id));
+      } else {
+        setCameraError('未检测到摄像头，请点左下角「相册」导入二维码');
       }
-    }).catch(err => console.error("Error getting cameras", err));
+    }).catch(err => {
+      console.error("Error getting cameras", err);
+      setCameraError('无法访问摄像头，请点左下角「相册」导入二维码');
+    });
   }, []);
 
   useEffect(() => {
@@ -419,7 +451,12 @@ const FullScanner = () => {
           await html5QrCode.start(
             selectedDeviceId,
             {
-              fps: 30,
+              fps: 12,
+              // 只解码取景框区域，避免整帧背景干扰，提升识别速度与准确率
+              qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
+                const edge = Math.floor(Math.min(viewfinderWidth, viewfinderHeight) * 0.6);
+                return { width: edge, height: edge };
+              },
               aspectRatio: 1.777778,
               videoConstraints: {
                 deviceId: { exact: selectedDeviceId },
@@ -433,7 +470,8 @@ const FullScanner = () => {
           );
           
           setIsCameraReady(true);
-          
+          setCameraError(null);
+
           if ('BarcodeDetector' in window) {
             const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
             const videoElement = document.querySelector("#reader video") as HTMLVideoElement;
@@ -450,7 +488,10 @@ const FullScanner = () => {
             nativeScanLoop();
           }
         } catch (err) {
-          if (isMounted && !String(err).includes("transition")) toast.error("相机启动失败，请重试");
+          if (isMounted) {
+            if (!String(err).includes("transition")) toast.error("相机启动失败，请重试");
+            setCameraError('相机启动失败，请点左下角「相册」导入二维码');
+          }
         }
       });
     };
@@ -652,21 +693,91 @@ const FullScanner = () => {
 
   const onScanSuccess = (decodedText: string) => {
     const now = Date.now();
-    if (isExecuting || isExecutingRef.current || (now - lastScanTimeRef.current < 2000)) return;
-
     const qr = parseQrText(decodedText);
-    if (qr) {
-      lastScanTimeRef.current = now;
-      if (!latestQrDataRef.current || latestQrDataRef.current.enc !== qr.enc) setLatestQrData(qr);
-      handleExecute(qr);
+    if (!qr) return;
+
+    // 记录最后一次成功识别的时间，用于失败提示节流
+    lastScanDetectedRef.current = now;
+
+    // 关键修复：执行中也必须同步最新的 enc。
+    // 重试循环每次都会读取 latestQrDataRef，二维码定时刷新（if_refresh_ewm）时
+    // 若这里直接 return，新的 enc 永远进不来，重试只会一直使用旧 enc。
+    if (!latestQrDataRef.current || latestQrDataRef.current.enc !== qr.enc) {
+      latestQrDataRef.current = qr;
+      setLatestQrData(qr);
     }
+
+    // 只在非执行态、且满足 2s 节流时才触发一次新的签到流程
+    if (isExecuting || isExecutingRef.current || (now - lastScanTimeRef.current < 2000)) return;
+    lastScanTimeRef.current = now;
+    handleExecute(qr);
   };
 
   useEffect(() => {
     scanSuccessHandlerRef.current = onScanSuccess;
   }, [onScanSuccess]);
 
-  const onScanFailure = () => {};
+  // 连续识别失败时的友好提示：前 6 秒不打扰，之后最多每 12 秒提示一次（同一 id 覆盖，不堆叠）
+  const onScanFailure = () => {
+    const now = Date.now();
+    const sinceLastSuccess = now - Math.max(lastScanDetectedRef.current, scanStartTimeRef.current);
+    if (sinceLastSuccess < 6000) return;
+    if (now - lastScanFailToastRef.current < 12000) return;
+    lastScanFailToastRef.current = now;
+    toast('未识别到二维码：请对准取景框、靠近屏幕，或点左下角「相册」导入图片', {
+      id: 'scan-fail-hint',
+      icon: '🔍',
+      duration: 4000,
+    });
+  };
+
+  // 从相册导入二维码图片：用 zxing-wasm（原生 ZXing 的 WASM 版本）解码，
+  // 对模糊、反光、复杂背景的鲁棒性远好于 jsQR。
+  const handleImageImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // 允许重复选择同一张图片
+    if (!file || isDecodingImage) return;
+
+    setIsDecodingImage(true);
+    const loadingToastId = toast.loading('正在识别图片中的二维码...');
+    try {
+      const reader = await getZxingReader();
+      const results = await reader.readBarcodes(file, {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: true,
+        tryInvert: true,
+        tryDownscale: true,
+        maxNumberOfSymbols: 1,
+      });
+      toast.dismiss(loadingToastId);
+
+      const text = results.find((r) => r.isValid && r.text)?.text || results.find((r) => r.text)?.text;
+      if (!text) {
+        toast.error('图片中未识别到二维码，请换一张更清晰的照片');
+        return;
+      }
+
+      const qr = parseQrText(text);
+      if (!qr) {
+        toast.error('这不是有效的学习通签到二维码');
+        return;
+      }
+
+      // 相册导入视为一次新的扫描：清空节流并同步最新二维码
+      lastScanTimeRef.current = 0;
+      latestQrDataRef.current = qr;
+      setLatestQrData(qr);
+      await handleExecute(qr);
+    } catch (err) {
+      toast.dismiss(loadingToastId);
+      console.error('Image QR decode failed', err);
+      const message = err instanceof Error ? err.message : '';
+      toast.error(message || '图片识别失败，请重试');
+    } finally {
+      setIsDecodingImage(false);
+    }
+  };
 
   const onTouchStart = (e: React.TouchEvent) => {
     // 如果上一轮被三指打断，新的触摸序列自动解锁，避免永久失效
@@ -795,6 +906,24 @@ const FullScanner = () => {
     >
       <div id="reader" ref={readerRef} className="w-full h-full" />
 
+      {/* 取景框：与 html5-qrcode 的 qrbox（短边 60%）保持对齐 */}
+      <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+        <div className="relative w-[60vmin] h-[60vmin]">
+          <span className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-white/90 rounded-tl-lg" />
+          <span className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-white/90 rounded-tr-lg" />
+          <span className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-white/90 rounded-bl-lg" />
+          <span className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-white/90 rounded-br-lg" />
+        </div>
+      </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handleImageImport}
+      />
+
       {/* Zoom Multiplier Overlay */}
       <AnimatePresence>
         {showZoomOverlay && (
@@ -834,6 +963,21 @@ const FullScanner = () => {
         </button>
         <h2 className="text-[20px] font-normal tracking-widest">扫一扫</h2>
       </div>
+
+      {/* 相机不可用提示：引导使用相册导入 */}
+      <AnimatePresence>
+        {cameraError && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.2 }}
+            className="absolute top-[calc(84px+var(--sat))] left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-full bg-black/60 backdrop-blur-sm border border-white/15 text-white text-xs font-bold tracking-wide text-center max-w-[88%] pointer-events-none"
+          >
+            {cameraError}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {!(isStealthMode && isAllSuccess) && (
@@ -954,7 +1098,7 @@ const FullScanner = () => {
       </AnimatePresence>
 
       <div className="absolute bottom-[calc(48px+var(--sab))] left-8 right-8 z-20 flex items-center justify-between pointer-events-none">
-        <div className="flex items-center space-x-6">
+        <div className="flex items-center space-x-4">
           <AnimatePresence initial={false}>
             {!isStealthMode && !isExecuting && (
               <>
@@ -986,6 +1130,23 @@ const FullScanner = () => {
                 >
                   <div className="w-14 h-14 bg-black/40 rounded-full flex items-center justify-center backdrop-blur-md border border-white/10 text-white shadow-lg"><Camera size={22} /></div>
                   <span className="text-[10px] text-white/80 font-bold tracking-wider">切换</span>
+                </motion.button>
+
+                <motion.button
+                  initial={{ x: -120, opacity: 0 }}
+                  animate={{ x: 0, opacity: 1 }}
+                  exit={{ x: -120, opacity: 0 }}
+                  transition={{ ease: "easeInOut", duration: 0.3 }}
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isDecodingImage}
+                  aria-label="从相册导入二维码"
+                  className="flex flex-col items-center space-y-2 group pointer-events-auto active:scale-95 transition-transform disabled:opacity-50"
+                >
+                  <div className="w-14 h-14 bg-black/40 rounded-full flex items-center justify-center backdrop-blur-md border border-white/10 text-white shadow-lg">
+                    {isDecodingImage ? <Loader2 size={22} className="animate-spin" /> : <ImagePlus size={22} />}
+                  </div>
+                  <span className="text-[10px] text-white/80 font-bold tracking-wider">相册</span>
                 </motion.button>
               </>
             )}
