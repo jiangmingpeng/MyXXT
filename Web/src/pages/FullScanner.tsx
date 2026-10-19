@@ -7,7 +7,8 @@ import toast from 'react-hot-toast';
 import client from '../api/client';
 import { useAuthStore } from '../store/auth';
 import { ProgressCard } from '../components/sign/ProgressCard';
-import type { ApiResponse, SignStatusMessage, Classmate, User } from '../types';
+import type { ApiResponse, SignStatusMessage, Classmate, User, SignExecuteResult } from '../types';
+import { SIGN_ERR_QR_EXPIRED } from '../constants';
 import scanCursor from '../assets/scan_cursor.png';
 import config from '../../config.yaml';
 
@@ -16,6 +17,8 @@ const LOCATION_PRESETS = config.sign?.location_presets || [];
 interface QrData {
   enc: string;
   c: string;
+  dbStrategy: string;
+  strategyPara: string;
   timestamp: number;
 }
 
@@ -69,6 +72,8 @@ const FullScanner = () => {
   
   const [isExecuting, setIsExecuting] = useState(false);
   const [latestQrData, setLatestQrData] = useState<QrData | null>(null);
+  // 上一次签到因二维码 enc 失效而被终止，需要提示用户重新扫码/粘贴
+  const [qrExpired, setQrExpired] = useState(false);
   const [signStatuses, setSignStatuses] = useState<Record<number, Partial<SignStatusMessage>>>({});
   
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -170,6 +175,8 @@ const FullScanner = () => {
 
   const { activity, selectedUids, classmates } = location.state || {};
   const latestQrDataRef = useRef<QrData | null>(null);
+  const qrExpiredRef = useRef(false);
+  const handlePasteRef = useRef<(event: ClipboardEvent) => void>(() => {});
   const isExecutingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const scanSuccessHandlerRef = useRef<(decodedText: string) => void>(() => {});
@@ -207,6 +214,10 @@ const FullScanner = () => {
   useEffect(() => {
     latestQrDataRef.current = latestQrData;
   }, [latestQrData]);
+
+  useEffect(() => {
+    qrExpiredRef.current = qrExpired;
+  }, [qrExpired]);
 
   useEffect(() => {
     isExecutingRef.current = isExecuting;
@@ -273,6 +284,8 @@ const FullScanner = () => {
     setIsExecuting(false);
     isExecutingRef.current = false;
     abortControllerRef.current?.abort();
+    qrExpiredRef.current = false;
+    setQrExpired(false);
     lastScanTimeRef.current = Date.now(); // 2s protection after close
   };
 
@@ -590,11 +603,22 @@ const FullScanner = () => {
       const url = new URL(text);
       const enc = url.searchParams.get('enc');
       const c = url.searchParams.get('c');
-      if (enc) return { enc, c: c || '', timestamp: Date.now() };
+      // 定时刷新二维码（widget/sign/e）会带查询策略，静态码没有。
+      const dbStrategy = url.searchParams.get('DB_STRATEGY') || '';
+      const strategyPara = url.searchParams.get('STRATEGY_PARA') || '';
+      if (enc) return { enc, c: c || '', dbStrategy, strategyPara, timestamp: Date.now() };
     } catch (e) {
       const encMatch = text.match(/[?&]enc=([^&]+)/);
       const cMatch = text.match(/[?&]c=([^&]+)/);
-      if (encMatch) return { enc: encMatch[1], c: cMatch ? cMatch[1] : '', timestamp: Date.now() };
+      const dbMatch = text.match(/[?&]DB_STRATEGY=([^&]+)/);
+      const paraMatch = text.match(/[?&]STRATEGY_PARA=([^&]+)/);
+      if (encMatch) return {
+        enc: encMatch[1],
+        c: cMatch ? cMatch[1] : '',
+        dbStrategy: dbMatch ? dbMatch[1] : '',
+        strategyPara: paraMatch ? paraMatch[1] : '',
+        timestamp: Date.now(),
+      };
     }
     return null;
   };
@@ -603,7 +627,8 @@ const FullScanner = () => {
     if (isExecutingRef.current) return;
     setIsExecuting(true);
     isExecutingRef.current = true;
-    abortControllerRef.current = new AbortController();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     
     const initialStatuses: Record<number, any> = {};
     orderedTargetUids.forEach(uid => initialStatuses[uid] = { status: 'pending', message: '等待中' });
@@ -649,12 +674,15 @@ const FullScanner = () => {
           }));
           try {
             const special_params: Record<string, any> = { enc: currentQr.enc, c: currentQr.c };
+            // 定时刷新二维码需要沿用链接里的查询策略（PRIMARY_KEY + id），静态码为空则不带。
+            if (currentQr.dbStrategy) special_params.db_strategy = currentQr.dbStrategy;
+            if (currentQr.strategyPara) special_params.strategy_para = currentQr.strategyPara;
             if (latRef.current && lngRef.current) {
               special_params.latitude = latRef.current;
               special_params.longitude = lngRef.current;
               special_params.description = locationStrRef.current;
             }
-            const execResp = await client.post<ApiResponse<any>>('/sign/execute', {
+            const execResp = await client.post<ApiResponse<SignExecuteResult>>('/sign/execute', {
               activity_id: activity.active_id, target_uid: uid, sign_type: 2,
               course_id: activity.course_id, class_id: activity.class_id, if_refresh_ewm: activity.if_refresh_ewm,
               special_params
@@ -662,6 +690,15 @@ const FullScanner = () => {
               signal: abortControllerRef.current?.signal
             });
             const res = execResp.data.data;
+            // 二维码已失效：立即终止该同学的重试循环，避免用旧 enc 空转。
+            if (res.code === SIGN_ERR_QR_EXPIRED) {
+              qrExpiredRef.current = true;
+              setQrExpired(true);
+              lastError = res.message || '二维码已过期，请重新扫码或粘贴';
+              setSignStatuses(prev => ({ ...prev, [uid]: { status: 'failed', message: lastError } }));
+              toast.error('二维码已过期，请重新粘贴或扫码', { id: 'qr-expired', duration: 5000 });
+              return;
+            }
             if (res.success || res.already_signed) {
               setSignStatuses(prev => ({ ...prev, [uid]: { status: 'success', message: res.message || '成功' } }));
               return;
@@ -687,8 +724,45 @@ const FullScanner = () => {
         toast.error(error.message || '执行过程出错');
       }
     } finally {
-      abortControllerRef.current = null;
+      // 仅清理本轮自己的 controller，避免把新一轮的 controller 置空
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
+  };
+
+  // 从图片文件中解码二维码文本（相册导入与剪贴板图片共用）
+  const decodeQrTextFromFile = async (file: File): Promise<string | null> => {
+    const reader = await getZxingReader();
+    const results = await reader.readBarcodes(file, {
+      formats: ['QRCode'],
+      tryHarder: true,
+      tryRotate: true,
+      tryInvert: true,
+      tryDownscale: true,
+      maxNumberOfSymbols: 1,
+    });
+    return results.find((r) => r.isValid && r.text)?.text || results.find((r) => r.text)?.text || null;
+  };
+
+  // 统一的二维码入口：扫码、相册导入、剪贴板粘贴都走这里。
+  // 执行中只同步最新 enc（供重试循环使用）；若上一轮因 enc 失效被终止，则允许立即重开。
+  const applyQrData = async (qr: QrData) => {
+    const wasExpired = qrExpiredRef.current;
+    qrExpiredRef.current = false;
+    setQrExpired(false);
+
+    lastScanTimeRef.current = 0;
+    latestQrDataRef.current = qr;
+    setLatestQrData(qr);
+
+    if (isExecutingRef.current) {
+      if (!wasExpired) return;
+      abortControllerRef.current?.abort();
+      setIsExecuting(false);
+      isExecutingRef.current = false;
+    }
+    await handleExecute(qr);
   };
 
   const onScanSuccess = (decodedText: string) => {
@@ -703,8 +777,21 @@ const FullScanner = () => {
     // 重试循环每次都会读取 latestQrDataRef，二维码定时刷新（if_refresh_ewm）时
     // 若这里直接 return，新的 enc 永远进不来，重试只会一直使用旧 enc。
     if (!latestQrDataRef.current || latestQrDataRef.current.enc !== qr.enc) {
+      const wasExpired = qrExpiredRef.current;
       latestQrDataRef.current = qr;
       setLatestQrData(qr);
+
+      // 上一轮因 enc 失效被终止时，扫到新的 enc 就自动重开一轮
+      if (wasExpired && isExecutingRef.current) {
+        qrExpiredRef.current = false;
+        setQrExpired(false);
+        abortControllerRef.current?.abort();
+        setIsExecuting(false);
+        isExecutingRef.current = false;
+        lastScanTimeRef.current = now;
+        handleExecute(qr);
+        return;
+      }
     }
 
     // 只在非执行态、且满足 2s 节流时才触发一次新的签到流程
@@ -741,18 +828,9 @@ const FullScanner = () => {
     setIsDecodingImage(true);
     const loadingToastId = toast.loading('正在识别图片中的二维码...');
     try {
-      const reader = await getZxingReader();
-      const results = await reader.readBarcodes(file, {
-        formats: ['QRCode'],
-        tryHarder: true,
-        tryRotate: true,
-        tryInvert: true,
-        tryDownscale: true,
-        maxNumberOfSymbols: 1,
-      });
+      const text = await decodeQrTextFromFile(file);
       toast.dismiss(loadingToastId);
 
-      const text = results.find((r) => r.isValid && r.text)?.text || results.find((r) => r.text)?.text;
       if (!text) {
         toast.error('图片中未识别到二维码，请换一张更清晰的照片');
         return;
@@ -764,11 +842,7 @@ const FullScanner = () => {
         return;
       }
 
-      // 相册导入视为一次新的扫描：清空节流并同步最新二维码
-      lastScanTimeRef.current = 0;
-      latestQrDataRef.current = qr;
-      setLatestQrData(qr);
-      await handleExecute(qr);
+      await applyQrData(qr);
     } catch (err) {
       toast.dismiss(loadingToastId);
       console.error('Image QR decode failed', err);
@@ -778,6 +852,60 @@ const FullScanner = () => {
       setIsDecodingImage(false);
     }
   };
+
+  // 剪贴板粘贴：支持两种形态
+  // 1) 直接复制二维码链接（text/plain）
+  // 2) 截图/复制图片（image/*），用 zxing 解码
+  const handlePaste = async (event: ClipboardEvent) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+
+    const text = clipboard.getData('text/plain')?.trim();
+    if (text) {
+      const qr = parseQrText(text);
+      if (qr) {
+        event.preventDefault();
+        toast.success('已从剪贴板识别二维码', { id: 'paste-qr' });
+        await applyQrData(qr);
+        return;
+      }
+    }
+
+    const items = Array.from(clipboard.items || []);
+    const imageItem = items.find((item) => item.kind === 'file' && item.type.startsWith('image/'));
+    const file = imageItem?.getAsFile();
+    if (!file) return;
+
+    event.preventDefault();
+    const loadingToastId = toast.loading('正在识别剪贴板图片...');
+    try {
+      const decoded = await decodeQrTextFromFile(file);
+      toast.dismiss(loadingToastId);
+
+      const qr = decoded ? parseQrText(decoded) : null;
+      if (!qr) {
+        toast.error('剪贴板图片中未识别到有效二维码', { id: 'paste-qr' });
+        return;
+      }
+      toast.success('已从剪贴板图片识别二维码', { id: 'paste-qr' });
+      await applyQrData(qr);
+    } catch (err) {
+      toast.dismiss(loadingToastId);
+      console.error('Clipboard image decode failed', err);
+      toast.error('剪贴板图片识别失败，请重试', { id: 'paste-qr' });
+    }
+  };
+
+  useEffect(() => {
+    handlePasteRef.current = handlePaste;
+  }, [handlePaste]);
+
+  // 注册一次全局 paste 监听，通过 ref 调用最新的处理函数，避免闭包读到旧状态。
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => handlePasteRef.current(event);
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, []);
 
   const onTouchStart = (e: React.TouchEvent) => {
     // 如果上一轮被三指打断，新的触摸序列自动解锁，避免永久失效
@@ -975,6 +1103,22 @@ const FullScanner = () => {
             className="absolute top-[calc(84px+var(--sat))] left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-full bg-black/60 backdrop-blur-sm border border-white/15 text-white text-xs font-bold tracking-wide text-center max-w-[88%] pointer-events-none"
           >
             {cameraError}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 二维码失效提示：引导用户重新粘贴/扫码 */}
+      <AnimatePresence>
+        {qrExpired && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.2 }}
+            className={`absolute left-1/2 -translate-x-1/2 z-40 w-[88%] rounded-2xl bg-rose-500/95 backdrop-blur-sm px-4 py-2.5 text-white shadow-lg pointer-events-none ${cameraError ? 'top-[calc(132px+var(--sat))]' : 'top-[calc(84px+var(--sat))]'}`}
+          >
+            <p className="text-xs font-bold">二维码已过期</p>
+            <p className="text-[11px] opacity-90 mt-0.5">请重新复制二维码链接或截图后粘贴，也可点左下角「相册」导入</p>
           </motion.div>
         )}
       </AnimatePresence>

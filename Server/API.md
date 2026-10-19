@@ -328,15 +328,31 @@ GET /api/sign/classmates?course_id=222&class_id=111
   "already_signed": false,
   "record_source": 343479151,
   "record_source_name": "张三",
-  "message": "签到成功"
+  "message": "签到成功",
+  "code": 0
 }
 ```
+
+业务错误码 `code`（`success=false` 时用于前端差异化提示）：
+
+| code | 含义 | 前端处理建议 |
+| --- | --- | --- |
+| 0 | 成功（含 `already_signed=true`） | 正常展示成功 |
+| 2001 | 二维码 enc 已失效（实测学习通返回 `签到失败，请重新扫描。`） | 提示重新扫码/粘贴，并终止该轮重试 |
+| 2002 | 该同学学习通登录态失效 | 提示重新登录 |
+| 2003 | 签到活动已结束 | 提示活动结束 |
+
+> 二维码凭据缓存：同一 `activity_id` 首次签到成功后会缓存 `{enc, c}`，后续代签目标在**未携带新 enc** 时复用该凭据；
+> 请求携带了新的 `enc` 时以请求为准，避免旧缓存覆盖刚扫到的新码；
+> 若学习通返回二维码失效，后端会自动清除缓存并返回 `code=2001`。
 
 `special_params` 按签到类型：
 - 普通签到(`0`): 可空
 - 二维码签到(`2`):
   - `enc` (required)
   - `c` (optional, 预签到场景可用)
+  - `db_strategy` (optional, 定时刷新二维码链接里的 `DB_STRATEGY`，如 `PRIMARY_KEY`)
+  - `strategy_para` (optional, 定时刷新二维码链接里的 `STRATEGY_PARA`，如 `id`)
   - `location` (optional, 二维码附加位置变种；可传对象/数组或 JSON 字符串，后端会透传给学习通)
   - `latitude` + `longitude` + `description` (optional, 兼容写法；后端会自动组装为 `location` 后透传)
 - 手势签到(`3`):

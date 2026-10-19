@@ -106,6 +106,9 @@ const Lobby = () => {
   const [expandedCourses, setExpandedCourses] = useState<Record<string, boolean>>({});
   const [now, setNow] = useState(Date.now());
   const [pendingEntry, setPendingEntry] = useState<PendingActivityEntry | null>(null);
+  // 新二维码签到提醒：轮询发现新的 sign_type=2 活动时展示
+  const [newQrAlert, setNewQrAlert] = useState<PendingActivityEntry | null>(null);
+  const knownActivityIdsRef = useRef<Set<number> | null>(null);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -122,6 +125,11 @@ const Lobby = () => {
       const data = response.data.data;
       setActivities(data || []);
 
+      // 首次拉取只记录基线，避免把历史活动误判为“新签到”
+      if (knownActivityIdsRef.current === null && data) {
+        knownActivityIdsRef.current = new Set(data.flatMap((c) => c.activities.map((a) => a.active_id)));
+      }
+
       // Update cache
       if (activeUid && data) {
         localStorage.setItem(`cached_activities_${activeUid}`, JSON.stringify(data));
@@ -134,8 +142,70 @@ const Lobby = () => {
   }, [isLoading, activeUid]);
 
   useEffect(() => {
+    // 切换账号时重建基线，避免把新账号的历史活动当成新签到
+    knownActivityIdsRef.current = null;
+    setNewQrAlert(null);
+  }, [activeUid]);
+
+  useEffect(() => {
     // Initial fetch
     fetchActivities();
+  }, [activeUid]);
+
+  // 轮询新活动：每 20 秒拉一次，只对“新的二维码签到且未签到/未结束”的活动提醒。
+  useEffect(() => {
+    if (!activeUid) return;
+    let cancelled = false;
+    const POLL_INTERVAL_MS = 20000;
+
+    const poll = async () => {
+      if (cancelled || document.hidden) return;
+      try {
+        const response = await client.get<ApiResponse<CourseActivities[]>>('/sign/activities');
+        if (cancelled) return;
+        const data = response.data.data || [];
+
+        const known = knownActivityIdsRef.current;
+        if (known === null) {
+          knownActivityIdsRef.current = new Set(data.flatMap((c) => c.activities.map((a) => a.active_id)));
+          return;
+        }
+
+        const nowMs = Date.now();
+        const newEntries: PendingActivityEntry[] = [];
+        data.forEach((course) => {
+          course.activities.forEach((activity) => {
+            if (known.has(activity.active_id)) return;
+            known.add(activity.active_id);
+            const isQrSign = activity.sign_type === 2;
+            const notSigned = !activity.record_source_name;
+            const notEnded = !activity.end_time || nowMs < activity.end_time;
+            if (isQrSign && notSigned && notEnded) {
+              newEntries.push({ activity, course });
+            }
+          });
+        });
+
+        if (newEntries.length === 0) return;
+
+        setActivities(data);
+        localStorage.setItem(`cached_activities_${activeUid}`, JSON.stringify(data));
+        setNewQrAlert(newEntries[0]);
+        toast(`检测到新的二维码签到：${newEntries[0].activity.activity_name}`, {
+          id: 'new-qr-activity',
+          icon: '📣',
+          duration: 6000,
+        });
+      } catch {
+        // 轮询失败保持静默，等待下一轮
+      }
+    };
+
+    const timer = setInterval(poll, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, [activeUid]);
 
   const toggleCourse = (courseId: number, classId: number) => {
@@ -248,6 +318,43 @@ const Lobby = () => {
           </div>
         </div>
       </div>
+
+      {/* 新二维码签到提醒 */}
+      <AnimatePresence>
+        {newQrAlert && (
+          <motion.div
+            initial={{ opacity: 0, y: -12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -12 }}
+            className="mx-4 mt-3 flex items-center gap-3 rounded-2xl border-2 border-purple-500 bg-purple-50 px-4 py-3 shadow-lg shadow-purple-500/10"
+          >
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-purple-600 text-white">
+              <QrCode size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[13px] font-bold text-purple-900">检测到新的二维码签到</p>
+              <p className="truncate text-xs text-purple-700">{newQrAlert.activity.activity_name}</p>
+            </div>
+            <button
+              onClick={() => {
+                const entry = newQrAlert;
+                setNewQrAlert(null);
+                enterActivity(entry.activity, entry.course);
+              }}
+              className="shrink-0 rounded-full bg-purple-600 px-3 py-1.5 text-xs font-bold text-white active:opacity-80"
+            >
+              去签到
+            </button>
+            <button
+              onClick={() => setNewQrAlert(null)}
+              className="shrink-0 p-1 text-purple-400 active:opacity-60"
+              aria-label="关闭提醒"
+            >
+              ✕
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Main Content */}
       <PullToRefresh

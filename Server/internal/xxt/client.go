@@ -83,6 +83,10 @@ type FixedParams struct {
 	CourseID     int64
 	ClassID      int64
 	IfRefreshEWM bool
+	// DBStrategy / StrategyPara 来自刷新二维码链接中的 DB_STRATEGY / STRATEGY_PARA。
+	// 定时刷新活动（widget/sign/e）使用 PRIMARY_KEY + id，静态二维码没有这两个参数。
+	DBStrategy   string
+	StrategyPara string
 }
 
 func New(aesKey, mobileUA string, insecureTLS bool, activeFetchMax int) *Client {
@@ -398,9 +402,10 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	vals.Set("appType", "15")
 	vals.Set("uid", strconv.FormatInt(fixed.UID, 10))
 	vals.Set("isTeacherViewOpen", "0")
-	if fixed.IfRefreshEWM {
-		rcode := fmt.Sprintf("SIGNIN:aid=%d&source=15&Code=%s&enc=%s", fixed.ActiveID, code, enc)
-		vals.Set("rcode", url.QueryEscape(rcode))
+	if fixed.IfRefreshEWM && code != "" {
+		// 注意：这里必须传原始字符串，vals.Encode() 会统一转义一次；
+		// 若提前 QueryEscape 会造成双重编码（SIGNIN%253Aaid...），学习通无法解析 rcode。
+		vals.Set("rcode", buildPreSignRCode(fixed.ActiveID, code, enc))
 	}
 
 	req, _ := http.NewRequest(http.MethodGet, "https://mobilelearn.chaoxing.com/newsign/preSign?"+vals.Encode(), nil)
@@ -409,30 +414,52 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	preBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// 刷新二维码是否被接受主要看这里：静态码/刷新码的差异只有 rcode。
+	log.Printf("[preSign] activeId=%d refresh=%t c=%s enc=%s body=%q",
+		fixed.ActiveID, fixed.IfRefreshEWM,
+		truncateForLog(code, 16), truncateForLog(enc, 24),
+		truncateForLog(strings.TrimSpace(string(preBody)), 300))
 
-	a1 := fmt.Sprintf("https://mobilelearn.chaoxing.com/pptSign/analysis?vs=1&DB_STRATEGY=RANDOM&aid=%d", fixed.ActiveID)
+	// 刷新二维码（widget/sign/e）链接会带 DB_STRATEGY=PRIMARY_KEY&STRATEGY_PARA=id，
+	// analysis / analysis2 必须沿用同一套查询策略；静态码没有该参数时保持 RANDOM。
+	dbStrategy := strings.TrimSpace(fixed.DBStrategy)
+	if dbStrategy == "" {
+		dbStrategy = "RANDOM"
+	}
+	strategyPara := strings.TrimSpace(fixed.StrategyPara)
+
+	a1Vals := buildAnalysisQuery(fixed.ActiveID, dbStrategy, strategyPara)
+	a1 := "https://mobilelearn.chaoxing.com/pptSign/analysis?" + a1Vals.Encode()
 	req2, _ := http.NewRequest(http.MethodGet, a1, nil)
 	req2.Header.Set("User-Agent", c.mobileUA)
 	resp2, err := cli.Do(req2)
 	if err != nil {
 		return err
 	}
-	defer resp2.Body.Close()
 	body2, _ := io.ReadAll(resp2.Body)
-	m := regexp.MustCompile(`code='\\+'(.*?)'`).FindSubmatch(body2)
-	if len(m) < 2 {
+	resp2.Body.Close()
+	code2, ok := extractAnalysisCode(body2)
+	log.Printf("[analysis] activeId=%d strategy=%s para=%s code=%t body=%q",
+		fixed.ActiveID, dbStrategy, strategyPara, ok,
+		truncateForLog(strings.TrimSpace(string(body2)), 300))
+	if !ok {
 		return nil
 	}
-	code2 := string(m[1])
-	a2 := "https://mobilelearn.chaoxing.com/pptSign/analysis2?DB_STRATEGY=RANDOM&code=" + url.QueryEscape(code2)
+	a2Vals := url.Values{}
+	a2Vals.Set("DB_STRATEGY", dbStrategy)
+	if strategyPara != "" {
+		a2Vals.Set("STRATEGY_PARA", strategyPara)
+	}
+	a2Vals.Set("code", code2)
+	a2 := "https://mobilelearn.chaoxing.com/pptSign/analysis2?" + a2Vals.Encode()
 	req3, _ := http.NewRequest(http.MethodGet, a2, nil)
 	req3.Header.Set("User-Agent", c.mobileUA)
 	resp3, err := cli.Do(req3)
 	if err == nil {
-		defer resp3.Body.Close()
 		_, _ = io.Copy(io.Discard, resp3.Body)
+		resp3.Body.Close()
 	}
 	return nil
 }
@@ -659,7 +686,54 @@ func (c *Client) doStuSignRequest(cli *http.Client, params url.Values) (string, 
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	return strings.TrimSpace(string(body)), nil
+	bodyStr := strings.TrimSpace(string(body))
+	// 便于排查二维码 enc 失效等场景：打印学习通原始返回。
+	log.Printf("[stuSignajax] activeId=%s uid=%s enc=%s validate=%t body=%q",
+		params.Get("activeId"), params.Get("uid"),
+		truncateForLog(params.Get("enc"), 24), params.Get("validate") != "",
+		truncateForLog(bodyStr, 300))
+	return bodyStr, nil
+}
+
+// analysisCodeRe 兼容学习通 analysis 页面里 code 的几种写法：
+// code='+xxx' / code='\+xxx' / code='\\+xxx' / code='\+'xxx'。
+var analysisCodeRe = regexp.MustCompile(`code='\\*\+'?([^']*)'`)
+
+func extractAnalysisCode(body []byte) (string, bool) {
+	m := analysisCodeRe.FindSubmatch(body)
+	if len(m) < 2 {
+		return "", false
+	}
+	return string(m[1]), true
+}
+
+// buildPreSignRCode 返回预签到 rcode 的原始值（未 URL 编码）。
+// 调用方应通过 url.Values.Set 写入，由 Encode() 统一转义一次。
+func buildPreSignRCode(activeID int64, code, enc string) string {
+	return fmt.Sprintf("SIGNIN:aid=%d&source=15&Code=%s&enc=%s", activeID, code, enc)
+}
+
+// buildAnalysisQuery 按二维码链接携带的查询策略组装 analysis 参数。
+// dbStrategy 为空时回退 RANDOM（静态二维码行为）；
+// strategyPara 形如 id 时，额外以该名字带上活动 id。
+func buildAnalysisQuery(activeID int64, dbStrategy, strategyPara string) url.Values {
+	dbStrategy = strings.TrimSpace(dbStrategy)
+	if dbStrategy == "" {
+		dbStrategy = "RANDOM"
+	}
+	strategyPara = strings.TrimSpace(strategyPara)
+
+	vals := url.Values{}
+	vals.Set("vs", "1")
+	vals.Set("DB_STRATEGY", dbStrategy)
+	vals.Set("aid", strconv.FormatInt(activeID, 10))
+	if strategyPara != "" {
+		vals.Set("STRATEGY_PARA", strategyPara)
+		if _, exists := vals[strategyPara]; !exists {
+			vals.Set(strategyPara, strconv.FormatInt(activeID, 10))
+		}
+	}
+	return vals
 }
 
 func sanitizeMultipartFilename(filename string) string {

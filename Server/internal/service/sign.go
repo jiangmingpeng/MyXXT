@@ -8,18 +8,20 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"xbt2/server/internal/common"
 	"xbt2/server/internal/model"
 	"xbt2/server/internal/xxt"
 )
 
 type SignService struct {
-	db  *gorm.DB
-	xxt *xxt.Client
-	cc  *CredentialCrypto
+	db       *gorm.DB
+	xxt      *xxt.Client
+	cc       *CredentialCrypto
+	encCache *CredentialCache
 }
 
 func NewSignService(db *gorm.DB, xxtClient *xxt.Client, cc *CredentialCrypto) *SignService {
-	return &SignService{db: db, xxt: xxtClient, cc: cc}
+	return &SignService{db: db, xxt: xxtClient, cc: cc, encCache: NewCredentialCache()}
 }
 
 type ExecuteSignRequest struct {
@@ -59,6 +61,8 @@ type SignExecuteResult struct {
 	RecordSource     int64  `json:"record_source"`
 	RecordSourceName string `json:"record_source_name"`
 	Message          string `json:"message"`
+	// Code 为业务错误码：0=成功，2001=二维码失效，2002=凭据失效，2003=签到已结束。
+	Code int `json:"code"`
 }
 
 func (s *SignService) CheckSignStates(activityID int64, userIDs []int64) ([]SignCheckItem, error) {
@@ -102,16 +106,74 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 		ClassID:      req.ClassID,
 		IfRefreshEWM: req.IfRefreshEWM,
 	}
+	// 二维码签到：优先使用本次请求携带的凭据（enc + c + 查询策略）。
+	// 缓存只作为兜底：请求没带 enc 时复用上一次成功使用过的凭据。
+	qrEnc, qrCode := "", ""
+	qrDBStrategy, qrStrategyPara := "", ""
 	if req.SignType == xxt.SignQRCode {
-		enc, _ := req.Special["enc"].(string)
-		code, _ := req.Special["c"].(string)
-		if err := s.xxt.PreSign(target.Mobile, password, fixed, code, enc); err != nil {
+		qrEnc, _ = req.Special["enc"].(string)
+		qrCode, _ = req.Special["c"].(string)
+		qrDBStrategy, _ = req.Special["db_strategy"].(string)
+		qrStrategyPara, _ = req.Special["strategy_para"].(string)
+		qrEnc = strings.TrimSpace(qrEnc)
+		qrCode = strings.TrimSpace(qrCode)
+		qrDBStrategy = strings.TrimSpace(qrDBStrategy)
+		qrStrategyPara = strings.TrimSpace(qrStrategyPara)
+
+		if cached, ok := s.encCache.Get(req.ActivityID); ok && cached.Enc != "" {
+			// 请求带了新 enc 时以请求为准，避免旧缓存覆盖刚扫到的新码。
+			if qrEnc == "" {
+				qrEnc, qrCode = cached.Enc, cached.C
+			} else if qrEnc == cached.Enc && qrCode == "" {
+				qrCode = cached.C
+			}
+			if qrDBStrategy == "" {
+				qrDBStrategy = cached.DBStrategy
+			}
+			if qrStrategyPara == "" {
+				qrStrategyPara = cached.StrategyPara
+			}
+		}
+		if qrEnc == "" {
+			return SignExecuteResult{
+				UserID:  req.TargetUID,
+				Success: false,
+				Code:    common.CodeQRCodeExpired,
+				Message: "二维码参数缺失，请重新扫码或粘贴",
+			}
+		}
+
+		fixed.DBStrategy = qrDBStrategy
+		fixed.StrategyPara = qrStrategyPara
+		// 刷新二维码链接一定带 c（sign_code），静态码没有。
+		// 即使活动详情没标记 if_refresh_ewm，也按刷新流程走预签到 rcode，避免漏参数。
+		if qrCode != "" {
+			fixed.IfRefreshEWM = true
+		}
+
+		if err := s.xxt.PreSign(target.Mobile, password, fixed, qrCode, qrEnc); err != nil {
 			return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: "预签到失败，请重试"}
+		}
+		if req.Special == nil {
+			req.Special = map[string]interface{}{}
+		}
+		req.Special["enc"] = qrEnc
+		if qrCode != "" {
+			req.Special["c"] = qrCode
 		}
 	}
 
 	result, err := s.xxt.Sign(target.Mobile, password, fixed, req.SignType, req.Special)
 	if err != nil {
+		if req.SignType == xxt.SignQRCode && xxt.IsQRCodeExpired(err.Error()) {
+			s.encCache.DeleteIfEnc(req.ActivityID, qrEnc)
+			return SignExecuteResult{
+				UserID:  req.TargetUID,
+				Success: false,
+				Code:    common.CodeQRCodeExpired,
+				Message: "二维码已过期，请重新扫码或粘贴",
+			}
+		}
 		return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(err.Error())}
 	}
 	result = strings.TrimSpace(result)
@@ -128,7 +190,26 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 				Message:          "该同学已在学习通签到",
 			}
 		}
+		if req.SignType == xxt.SignQRCode && xxt.IsQRCodeExpired(result) {
+			s.encCache.DeleteIfEnc(req.ActivityID, qrEnc)
+			return SignExecuteResult{
+				UserID:  req.TargetUID,
+				Success: false,
+				Code:    common.CodeQRCodeExpired,
+				Message: "二维码已过期，请重新扫码或粘贴",
+			}
+		}
 		return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(result)}
+	}
+
+	// 仅在签到成功后写入缓存：保证缓存里的 enc 一定被学习通接受过。
+	if req.SignType == xxt.SignQRCode && qrEnc != "" {
+		s.encCache.Set(req.ActivityID, QRCredential{
+			Enc:          qrEnc,
+			C:            qrCode,
+			DBStrategy:   qrDBStrategy,
+			StrategyPara: qrStrategyPara,
+		})
 	}
 
 	rec := model.SignRecord{

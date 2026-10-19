@@ -93,3 +93,14 @@ export interface SignCheckItem {
   record_source_name: string;
   message: string;
 }
+
+export interface SignExecuteResult {
+  user_id: number;
+  success: boolean;
+  already_signed: boolean;
+  record_source: number;
+  record_source_name: string;
+  message: string;
+  /** 业务错误码：0=成功，2001=二维码失效，2002=凭据失效，2003=签到已结束 */
+  code: number;
+}

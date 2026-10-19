@@ -203,3 +203,60 @@ func boolFromAny(v interface{}) bool {
 		return false
 	}
 }
+
+// qrCodeExpiredKeywords 是学习通 stuSignajax 在二维码 enc 失效时可能返回的文案。
+// 已实测：enc 无效时返回 "签到失败，请重新扫描。"（validate 是否携带都一样）。
+var qrCodeExpiredKeywords = []string{
+	"请重新扫描",
+	"重新扫描二维码",
+	"二维码已过期",
+	"二维码过期",
+	"二维码失效",
+	"二维码已失效",
+	"二维码已刷新",
+	"无效二维码",
+	"无效的二维码",
+	"请刷新二维码",
+	"请重新扫码",
+	"enc已失效",
+	"enc 已失效",
+}
+
+// IsQRCodeExpired 判断 stuSignajax 的返回（纯文本或 JSON）是否表示二维码 enc 已失效。
+// 注意：活动结束（“活动已结束”）属于 CodeSignEnded，不在此列。
+func IsQRCodeExpired(body string) bool {
+	msg := strings.TrimSpace(body)
+	if msg == "" {
+		return false
+	}
+	// 学习通部分接口返回 JSON，优先结构化解析，避免误判。
+	if strings.HasPrefix(msg, "{") {
+		msg = stuSignMessageFromJSON(msg)
+	}
+	lower := strings.ToLower(msg)
+	for _, kw := range qrCodeExpiredKeywords {
+		if strings.Contains(lower, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+// stuSignMessageFromJSON 从 JSON 返回中提取可读文案；解析失败时原样返回。
+func stuSignMessageFromJSON(body string) string {
+	var payload struct {
+		Msg      string `json:"msg"`
+		Message  string `json:"message"`
+		ErrorMsg string `json:"errorMsg"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return body
+	}
+	for _, s := range []string{payload.Msg, payload.Message, payload.ErrorMsg, payload.Error} {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return body
+}

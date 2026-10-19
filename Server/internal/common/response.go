@@ -13,5 +13,10 @@ func Success(c *gin.Context, data interface{}) {
 }
 
 func Fail(c *gin.Context, status int, message string) {
-	c.JSON(status, APIResponse{Code: 1, Message: message, Data: nil})
+	c.JSON(status, APIResponse{Code: CodeFail, Message: message, Data: nil})
+}
+
+// FailWithCode 允许返回业务错误码（如二维码失效），用于前端按 code 做差异化处理。
+func FailWithCode(c *gin.Context, status int, code int, message string) {
+	c.JSON(status, APIResponse{Code: code, Message: message, Data: nil})
 }
