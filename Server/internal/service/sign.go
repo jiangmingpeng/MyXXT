@@ -3,7 +3,9 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -151,8 +153,32 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 			fixed.IfRefreshEWM = true
 		}
 
-		if err := s.xxt.PreSign(target.Mobile, password, fixed, qrCode, qrEnc); err != nil {
+		// 刷新二维码的 enc 时效很短（约 5~10s），必须尽量压缩单次签到耗时。
+		// 预签到使用目标账号会话，验证码使用独立临时 cookie jar，两者互不依赖，可以安全并行。
+		// 验证码预抓失败时留空，xxt.Sign 内部会同步抓取兜底（只影响速度，不影响正确性）。
+		var (
+			preSignErr error
+			validate   string
+			captchaErr error
+		)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			preSignErr = s.xxt.PreSign(target.Mobile, password, fixed, qrCode, qrEnc)
+		}()
+		go func() {
+			defer wg.Done()
+			validate, captchaErr = s.xxt.FetchCaptchaValidate(fixed)
+		}()
+		wg.Wait()
+
+		if preSignErr != nil {
 			return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: "预签到失败，请重试"}
+		}
+		if captchaErr != nil {
+			log.Printf("[captcha] prefetch failed: activity=%d uid=%d err=%v", fixed.ActiveID, fixed.UID, captchaErr)
+			validate = ""
 		}
 		if req.Special == nil {
 			req.Special = map[string]interface{}{}
@@ -160,6 +186,10 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 		req.Special["enc"] = qrEnc
 		if qrCode != "" {
 			req.Special["c"] = qrCode
+		}
+		if validate != "" {
+			// 交给 xxt.Sign 复用，避免再串行抓一次验证码。
+			req.Special["validate"] = validate
 		}
 	}
 

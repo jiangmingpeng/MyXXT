@@ -21,6 +21,13 @@ import (
 	"time"
 )
 
+// FetchCaptchaValidate 预抓一次滑动验证码，返回可直接用于 stuSignajax 的 validate。
+// 验证码使用独立的临时 cookie jar，与目标账号会话互不影响，
+// 因此调用方可以把它和预签到等步骤并行执行，缩短刷新二维码的签到耗时。
+func (c *Client) FetchCaptchaValidate(fixed FixedParams) (string, error) {
+	return c.fetchCaptchaValidate(fixed)
+}
+
 func (c *Client) fetchCaptchaValidate(fixed FixedParams) (string, error) {
 	jar, _ := cookiejar.New(nil)
 	captchaHTTP := *c.http

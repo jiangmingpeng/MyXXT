@@ -711,7 +711,11 @@ const FullScanner = () => {
             setSignStatuses(prev => ({ ...prev, [uid]: { ...prev[uid], message: lastError } }));
           }
           if (attempt < MAX_RETRIES) {
-            const delay = attempt < 3 ? 1000 : 2000;
+            // 定时刷新二维码的 enc 只有几秒有效期：固定等待 1~2s 会直接吃掉刷新窗口。
+            // 刷新码立即用下一次读数里的最新 enc 重试（留 150ms 防止空转）；
+            // 静态码保持原有退避，避免对学习通造成无意义压力。
+            const isRefreshQr = !!currentQr.c || !!activity.if_refresh_ewm;
+            const delay = isRefreshQr ? 150 : (attempt < 3 ? 1000 : 2000);
             for (let i = 0; i < delay; i += 100) {
               if (!isExecutingRef.current) return;
               await new Promise(resolve => setTimeout(resolve, 100));
