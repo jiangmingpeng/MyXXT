@@ -68,6 +68,68 @@ func TestApplyLocationFieldsLegacyKeys(t *testing.T) {
 	}
 }
 
+// 实测 2026-10-20 的 getPPTActiveInfo 返回：经纬度全是空串/0，只有
+// locationRange + locationText（格式化地址 + POI 名）可用。
+// 这种返回必须解析出半径和地址，同时不能把 (0,0) 当成合法圆心。
+func TestApplyLocationFieldsRealActiveInfoDump(t *testing.T) {
+	raw := `{
+		"result": 1,
+		"data": {
+			"activeId": 6000177345246,
+			"otherId": 4,
+			"ifopenAddress": 1,
+			"ifgetrange": null,
+			"latitude": 0,
+			"longitude": 0,
+			"locationLatitude": "",
+			"locationLongitude": "",
+			"locationLatitude_gd": "",
+			"locationLongitude_gd": "",
+			"locationRange": 1000,
+			"locationText": "湖南省湘西土家族苗族自治州吉首市人民南路120号 吉首大学-图书馆"
+		}
+	}`
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	var detail SignDetail
+	applyLocationFields(&detail, payload)
+
+	if detail.LocationRange != 1000 {
+		t.Fatalf("LocationRange = %v, want 1000", detail.LocationRange)
+	}
+	if detail.LocationAddress != "湖南省湘西土家族苗族自治州吉首市人民南路120号 吉首大学-图书馆" {
+		t.Fatalf("LocationAddress = %q, want locationText", detail.LocationAddress)
+	}
+	if ValidLatLng(detail.LocationLatitude, detail.LocationLongitude) {
+		t.Fatalf("coords = (%v, %v), want invalid (server strips center)",
+			detail.LocationLatitude, detail.LocationLongitude)
+	}
+	// 有半径就说明该活动启用了位置校验，前端要据此画圈/提示。
+	if !detail.IfOpenAddress {
+		t.Fatal("IfOpenAddress = false, want true (range present)")
+	}
+}
+
+// 空的 locationLatitude 不能挡住后面成对出现的有效坐标。
+func TestLocationPairFromAnySkipsEmptyFirstCandidate(t *testing.T) {
+	var payload map[string]interface{}
+	raw := `{"data":{"locationLatitude":"","locationLongitude":"","activeLatitude":"28.1","activeLongitude":"109.7"}}`
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	lat, lng, ok := locationPairFromAny(payload)
+	if !ok {
+		t.Fatal("locationPairFromAny = false, want true")
+	}
+	if lat != 28.1 || lng != 109.7 {
+		t.Fatalf("coords = (%v, %v), want (28.1, 109.7)", lat, lng)
+	}
+}
+
 // 没有定位字段的活动不能被误判成“启用了位置校验”。
 func TestApplyLocationFieldsWithoutLocation(t *testing.T) {
 	var payload map[string]interface{}

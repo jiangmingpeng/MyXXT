@@ -7,7 +7,7 @@ import toast from 'react-hot-toast';
 import client from '../api/client';
 import { useAuthStore } from '../store/auth';
 import { useSignStore } from '../store/sign';
-import { distanceMeters } from '../utils/coord';
+import { distanceMeters, formatCoord } from '../utils/coord';
 import { ProgressCard } from '../components/sign/ProgressCard';
 import { MapPicker } from '../components/sign/MapPicker';
 import type { MapPickerResult } from '../components/sign/MapPicker';
@@ -207,10 +207,15 @@ const FullScanner = () => {
   const signCenterLat = Number(activity?.location_latitude) || 0;
   const signCenterLng = Number(activity?.location_longitude) || 0;
   const signRangeMeters = Number(activity?.location_range) || 0;
+  // 学习通只下发地址（locationText）时，圆心由地图选点页按地址反查得到，
+  // 确认选点时通过 MapPickerResult.signLat/signLng 回传，用它做半径校验。
+  const [resolvedSignCenter, setResolvedSignCenter] = useState<{ lat: number; lng: number } | null>(null);
+  const centerLat = signCenterLat || resolvedSignCenter?.lat || 0;
+  const centerLng = signCenterLng || resolvedSignCenter?.lng || 0;
   const pickedLocationOutOfRange = isLocationOutsideSignRange(
     pickedLocation,
-    signCenterLat,
-    signCenterLng,
+    centerLat,
+    centerLng,
     signRangeMeters
   );
   const latestQrDataRef = useRef<QrData | null>(null);
@@ -793,6 +798,10 @@ const FullScanner = () => {
   // 若扫码时因尚未选点被挂起，选完立即提交，缩短 enc 的过期窗口。
   const handleMapLocationConfirm = (result: MapPickerResult) => {
     skipAutoLocationPickerRef.current = false;
+    if (Number(result.signLat) > 0 && Number(result.signLng) > 0) {
+      // 后端没下发经纬度、由地址反查得到的圆心，留在这里继续做半径校验
+      setResolvedSignCenter({ lat: Number(result.signLat), lng: Number(result.signLng) });
+    }
     setPickedLocation({
       name: result.name,
       lat: result.lat,
@@ -810,6 +819,85 @@ const FullScanner = () => {
     }
   };
 
+  /**
+   * 兼容旧后端：从返回文案里兜底解析“距签到圆心多少米”。
+   * 新后端会直接给 location_distance_meters；旧后端只有原文
+   * （errorLocation2_1137.0）或翻译后的“距签到点约 1137 米”。
+   */
+  const parseDistanceFromText = (text?: string): number | null => {
+    if (!text) return null;
+    const raw = /errorLocation\d*_(\d+(?:\.\d+)?)/i.exec(text);
+    if (raw) {
+      const value = Number(raw[1]);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+    const translated = /距签到点约\s*(\d+)\s*米/.exec(text);
+    if (translated) {
+      const value = Number(translated[1]);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+    return null;
+  };
+
+  /**
+   * 圆心探测：真实提交一次坐标，只为拿到学习通返回的“距签到圆心多少米”
+   * （errorLocation2_<米>，后端已解析成 location_distance_meters）。
+   *
+   * 学习通不下发圆心经纬度，这个距离是唯一精确标尺；地图选点里的
+   * “自动校准圆心”用它做三边定位反解真实圆心。探测点一般都在范围外，
+   * 万一恰好落在范围内就等于直接签到成功，如实返回 signed。
+   */
+  const probeSignCenterDistance = async (point: { lng: number; lat: number }) => {
+    const qr = latestQrDataRef.current || pendingQrRef.current;
+    const targetUid = orderedTargetUids[0];
+    if (!activity || !qr?.enc || !targetUid) {
+      return { signed: false, distance: null, message: '还没有拿到二维码或账号信息，无法校准' };
+    }
+
+    const special_params: Record<string, any> = {
+      enc: qr.enc,
+      latitude: formatCoord(point.lat),
+      longitude: formatCoord(point.lng),
+      // 必须带上地址：学习通对空地址偶尔只回不带距离的 errorLocationX，
+      // 那样就解不出圆心；正常能回 errorLocation2_<米> 的提交都带完整地址。
+      description: activity.location_address || '',
+    };
+    if (qr.c) special_params.c = qr.c;
+    if (qr.dbStrategy) special_params.db_strategy = qr.dbStrategy;
+    if (qr.strategyPara) special_params.strategy_para = qr.strategyPara;
+
+    const resp = await client.post<ApiResponse<SignExecuteResult>>('/sign/execute', {
+      activity_id: activity.active_id,
+      target_uid: targetUid,
+      sign_type: 2,
+      course_id: activity.course_id,
+      class_id: activity.class_id,
+      if_refresh_ewm: activity.if_refresh_ewm,
+      special_params,
+    });
+    const res = resp.data.data;
+    const signed = !!(res.success || res.already_signed);
+    const distance =
+      typeof res.location_distance_meters === 'number'
+        ? res.location_distance_meters
+        : parseDistanceFromText(res.message);
+    console.info(
+      '[sign] 圆心探测:',
+      `${point.lng},${point.lat}`,
+      `signed=${signed}`,
+      `distance=${distance}`,
+      res.message
+    );
+    if (signed) {
+      // 探测顺带签上了：同步面板状态，避免用户再提交一次。
+      setSignStatuses((prev) => ({
+        ...prev,
+        [targetUid]: { status: 'success', message: res.message || '签到成功' },
+      }));
+    }
+    return { signed, distance, message: res.message };
+  };
+
   // 统一入口：已明确选择过位置（含“不使用位置”）直接提交；
   // 否则暂存二维码并弹出地图选点，确认后立即提交。
   // 位置校验类活动（有老师圆心+半径）额外检查：已选点超出半径时先让用户重选，
@@ -818,9 +906,9 @@ const FullScanner = () => {
     const state = useSignStore.getState();
     const outsideRange = isLocationOutsideSignRange(
       state.location,
-      Number(activity?.location_latitude),
-      Number(activity?.location_longitude),
-      Number(activity?.location_range)
+      centerLat,
+      centerLng,
+      signRangeMeters
     );
 
     if (state.decided && !outsideRange) {
@@ -1500,6 +1588,7 @@ const FullScanner = () => {
         signLat={activity?.location_latitude}
         signRange={activity?.location_range}
         signAddress={activity?.location_address}
+        onProbeDistance={probeSignCenterDistance}
         onClose={() => {
           setIsMapPickerOpen(false);
           // 取消兜底选点：丢弃挂起的二维码，避免用旧 enc 继续提交，

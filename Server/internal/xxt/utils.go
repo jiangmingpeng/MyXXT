@@ -335,6 +335,34 @@ func IsQRCodeExpired(body string) bool {
 // 第二个捕获组是距离（单位米），可能带小数。
 var locationErrorRe = regexp.MustCompile(`(?i)errorLocation[_]?(\d+)(?:_(\d+(?:\.\d+)?))?`)
 
+// ParseLocationErrorDistance 从学习通位置校验失败的返回里提取“距签到圆心多少米”。
+//
+// 只有带 “_距离” 后缀的才算有效距离：
+//
+//	errorLocation2_1137.0 -> 1137 米
+//	errorLocation3        -> 不是距离（3 是错误码）
+//
+// 这个距离是唯一可信的圆心标尺（学习通不下发圆心经纬度），前端的三边定位
+// 校准就是靠反复探测这个距离来反解真实圆心。
+func ParseLocationErrorDistance(raw string) (float64, bool) {
+	msg := strings.TrimSpace(raw)
+	if msg == "" {
+		return 0, false
+	}
+	if strings.HasPrefix(msg, "{") {
+		msg = stuSignMessageFromJSON(msg)
+	}
+	m := locationErrorRe.FindStringSubmatch(msg)
+	if len(m) < 3 || m[2] == "" {
+		return 0, false
+	}
+	d, err := strconv.ParseFloat(m[2], 64)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 // ExplainLocationError 把 stusignajax 的位置校验错误翻译成可操作的中文提示。
 // 返回空字符串表示该返回不是位置校验错误。
 func ExplainLocationError(raw string) string {

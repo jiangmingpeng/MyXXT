@@ -329,9 +329,14 @@ GET /api/sign/classmates?course_id=222&class_id=111
   "record_source": 343479151,
   "record_source_name": "张三",
   "message": "签到成功",
-  "code": 0
+  "code": 0,
+  "location_distance_meters": 1137
 }
 ```
+
+`location_distance_meters`（可选）：仅位置校验失败且学习通返回 `errorLocation2_<米>`（如 `errorLocation2_1137.0`）时出现，
+表示本次提交点距老师设置的签到圆心多少米。学习通**不下发**圆心经纬度，前端据此做三边定位
+（3 个不共线的探测点各提交一次）即可反解出真实圆心，再用该点提交即签到成功。
 
 业务错误码 `code`（`success=false` 时用于前端差异化提示）：
 

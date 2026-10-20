@@ -65,6 +65,18 @@ type SignExecuteResult struct {
 	Message          string `json:"message"`
 	// Code 为业务错误码：0=成功，2001=二维码失效，2002=凭据失效，2003=签到已结束。
 	Code int `json:"code"`
+	// LocationDistanceMeters 是位置校验失败时学习通返回的“距签到圆心距离（米）”。
+	// 学习通不下发圆心经纬度，这个距离是唯一精确标尺，
+	// 前端据此做三边定位，反解出老师的真实圆心。为空表示本次返回没带距离。
+	LocationDistanceMeters *float64 `json:"location_distance_meters,omitempty"`
+}
+
+// withLocationDistance 把 errorLocation2_<米> 里的距离挂到结果上，供前端校准圆心。
+func withLocationDistance(res SignExecuteResult, raw string) SignExecuteResult {
+	if d, ok := xxt.ParseLocationErrorDistance(raw); ok {
+		res.LocationDistanceMeters = &d
+	}
+	return res
 }
 
 func (s *SignService) CheckSignStates(activityID int64, userIDs []int64) ([]SignCheckItem, error) {
@@ -204,7 +216,10 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 				Message: "二维码已过期，请重新扫码或粘贴",
 			}
 		}
-		return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(err.Error())}
+		return withLocationDistance(
+			SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(err.Error())},
+			err.Error(),
+		)
 	}
 	result = strings.TrimSpace(result)
 	if result != "success" {
@@ -229,7 +244,10 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 				Message: "二维码已过期，请重新扫码或粘贴",
 			}
 		}
-		return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(result)}
+		return withLocationDistance(
+			SignExecuteResult{UserID: req.TargetUID, Success: false, Message: s.toUserSignMessage(result)},
+			result,
+		)
 	}
 
 	// 仅在签到成功后写入缓存：保证缓存里的 enc 一定被学习通接受过。

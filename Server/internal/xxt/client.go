@@ -461,8 +461,14 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 	// （同时也会再打一次诊断日志，方便定位字段名）。
 	detail.LocationFetched = ValidLatLng(detail.LocationLatitude, detail.LocationLongitude)
 	if !detail.LocationFetched && (detail.SignType == SignQRCode || detail.SignType == SignLocation) {
-		log.Printf("[activeInfo] activity=%d 未能解析到签到圆心，前端将无法画圈 signType=%d ifopenAddress=%v range=%d",
-			activityID, detail.SignType, detail.IfOpenAddress, detail.LocationRange)
+		// 学习通实测只下发 range/locationText，经纬度字段是空串 → 前端会用地址反查圆心。
+		if detail.LocationAddress != "" {
+			log.Printf("[activeInfo] activity=%d 未下发圆心经纬度，改用地址反查 signType=%d range=%d address=%q",
+				activityID, detail.SignType, detail.LocationRange, truncateForLog(detail.LocationAddress, 120))
+		} else {
+			log.Printf("[activeInfo] activity=%d 未能解析到签到圆心，前端将无法画圈 signType=%d ifopenAddress=%v range=%d",
+				activityID, detail.SignType, detail.IfOpenAddress, detail.LocationRange)
+		}
 	}
 	return detail, nil
 }
@@ -470,7 +476,26 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 // fetchActiveInfo 拉取活动详情（getPPTActiveInfo），用于读取签到圆心与半径。
 // 该接口返回结构随版本变化，这里保留原始 map 交给 applyLocationFields 做兼容解析。
 func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string]interface{}, error) {
-	u := fmt.Sprintf("https://mobilelearn.chaoxing.com/v2/apis/active/getPPTActiveInfo?activeId=%d", activityID)
+	base := fmt.Sprintf("https://mobilelearn.chaoxing.com/v2/apis/active/getPPTActiveInfo?activeId=%d", activityID)
+	payload, err := c.getActiveInfoJSON(cli, activityID, base)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, ok := locationPairFromAny(payload); ok {
+		return payload, nil
+	}
+	// 默认请求拿不到圆心时再带 ifgetrange=1 试一次：返回体里本身就带 ifgetrange 字段，
+	// 说明服务端支持“按需下发签到范围/圆心”。
+	retry, retryErr := c.getActiveInfoJSON(cli, activityID, base+"&ifgetrange=1")
+	if retryErr == nil {
+		if _, _, ok := locationPairFromAny(retry); ok {
+			return retry, nil
+		}
+	}
+	return payload, nil
+}
+
+func (c *Client) getActiveInfoJSON(cli *http.Client, activityID int64, u string) (map[string]interface{}, error) {
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	req.Header.Set("User-Agent", c.mobileUA)
 	resp, err := cli.Do(req)
@@ -484,13 +509,13 @@ func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string
 	}
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		log.Printf("[activeInfo] activity=%d status=%d 非 JSON 返回 body=%q", activityID, resp.StatusCode,
-			truncateForLog(strings.TrimSpace(string(raw)), 300))
+		log.Printf("[activeInfo] activity=%d status=%d url=%s 非 JSON 返回 body=%q", activityID, resp.StatusCode,
+			u, truncateForLog(strings.TrimSpace(string(raw)), 300))
 		return nil, err
 	}
 	// 完整原始返回只截断到 2000 字符，必要时能看到 data 里的字段名。
-	log.Printf("[activeInfo] activity=%d status=%d body=%q", activityID, resp.StatusCode,
-		truncateForLog(strings.TrimSpace(string(raw)), 2000))
+	log.Printf("[activeInfo] activity=%d status=%d url=%s body=%q", activityID, resp.StatusCode,
+		u, truncateForLog(strings.TrimSpace(string(raw)), 2000))
 	return payload, nil
 }
 
@@ -519,21 +544,29 @@ func logLocationCandidates(tag string, activityID int64, payload interface{}) bo
 // 学习通不同接口/版本里定位字段名不一致，这里按优先级列出候选名。
 // 同时覆盖大小写变体（部分老接口返回全小写）。
 var (
-	locationLatKeys = []string{
-		"locationLatitude", "locationlatitude", "activeLatitude", "signLatitude",
-		"latitude",
-	}
-	locationLngKeys = []string{
-		"locationLongitude", "locationlongitude", "activeLongitude", "signLongitude",
-		"longitude",
+	// locationLatLngPairs 是成对的经纬度字段：同一组两个字段一定同时出现，
+	// 必须成对解析。实测 getPPTActiveInfo 会同时下发
+	// locationLatitude=""（空串）、latitude=0 和 locationLatitude_gd=""，
+	// 按“第一个命中的 key”去取值会被空串挡住，导致永远解析不到圆心。
+	locationLatLngPairs = [][2]string{
+		{"locationLatitude", "locationLongitude"},
+		{"locationLatitude_gd", "locationLongitude_gd"},
+		{"locationlatitude", "locationlongitude"},
+		{"activeLatitude", "activeLongitude"},
+		{"signLatitude", "signLongitude"},
+		{"latitude", "longitude"},
 	}
 	locationRangeKeys = []string{
 		"locationRange", "locationrange", "activeRange", "signRange",
 		"radius", "range",
 	}
+	// locationText 是学习通下发的“格式化地址 + POI 名”，
+	// 例如 “湖南省湘西…人民南路120号 吉首大学-图书馆”。
+	// 它常常是唯一可用的定位线索（经纬度被服务端置空），前端可据此反查圆心。
 	locationAddrKeys = []string{
 		"locationAddress", "locationaddress", "activeAddress", "signAddress",
-		"address", "location",
+		"locationText", "locationtext", "positionText", "positiontext",
+		"locationName", "locationname", "address", "location",
 	}
 	locationOpenKeys = []string{
 		"ifopenAddress", "ifopenaddress", "ifOpenAddress",
@@ -547,14 +580,9 @@ func applyLocationFields(detail *SignDetail, payload map[string]interface{}) {
 	if detail == nil || len(payload) == 0 {
 		return
 	}
-	if lat, ok := floatFromAny(deepFindFirst(payload, locationLatKeys...)); ok {
-		if lng, ok2 := floatFromAny(deepFindFirst(payload, locationLngKeys...)); ok2 {
-			// 0 或超范围视为无效，避免把空字段当成北京天安门外的海面坐标。
-			if ValidLatLng(lat, lng) {
-				detail.LocationLatitude = lat
-				detail.LocationLongitude = lng
-			}
-		}
+	if lat, lng, ok := locationPairFromAny(payload); ok {
+		detail.LocationLatitude = lat
+		detail.LocationLongitude = lng
 	}
 	if rng := int64FromAny(deepFindFirst(payload, locationRangeKeys...)); rng > 0 {
 		detail.LocationRange = rng
@@ -568,6 +596,27 @@ func applyLocationFields(detail *SignDetail, payload map[string]interface{}) {
 		// 没显式声明时，只要拿到了圆心/半径就认为该活动启用了位置校验。
 		detail.IfOpenAddress = true
 	}
+}
+
+// locationPairFromAny 按候选组合成对解析经纬度。
+// 关键点：第一个候选（locationLatitude）即使存在也可能是个空字符串，
+// 必须继续往后试，直到拿到一对合法坐标为止。
+func locationPairFromAny(payload map[string]interface{}) (float64, float64, bool) {
+	for _, pair := range locationLatLngPairs {
+		lat, ok := floatFromAny(deepFindFirst(payload, pair[0]))
+		if !ok {
+			continue
+		}
+		lng, ok := floatFromAny(deepFindFirst(payload, pair[1]))
+		if !ok {
+			continue
+		}
+		// 0 或超范围视为无效，避免把空字段当成北京天安门外的海面坐标。
+		if ValidLatLng(lat, lng) {
+			return lat, lng, true
+		}
+	}
+	return 0, 0, false
 }
 
 // firstBoolField 按候选名顺序查找布尔字段，返回 (值, 是否存在)。

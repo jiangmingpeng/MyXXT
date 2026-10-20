@@ -111,4 +111,9 @@ export interface SignExecuteResult {
   message: string;
   /** 业务错误码：0=成功，2001=二维码失效，2002=凭据失效，2003=签到已结束 */
   code: number;
+  /**
+   * 位置校验失败时学习通返回的“距签到圆心距离（米）”（errorLocation2_xxx）。
+   * 学习通不下发圆心经纬度，前端靠这个距离做三边定位反解真实圆心。
+   */
+  location_distance_meters?: number;
 }
