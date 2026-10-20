@@ -142,24 +142,39 @@ func (h *SignHandler) buildCourseActivityGroup(uid int64, user model.User, passw
 		cacheFound := cacheErr == nil
 
 		if cacheFound && cache.EndTime != manualEndTimeSentinel {
-			detail = xxt.SignDetail{
-				StartTime:    cache.StartTime,
-				EndTime:      cache.EndTime,
-				SignType:     cache.SignType,
-				IfRefreshEWM: cache.IfRefreshEWM,
-				IfPhoto:      cache.IfPhoto,
+			detail = detailFromActivityCache(cache)
+			// 位置校验类活动（二维码/位置签到）需要老师设置的签到圆心；
+			// 升级前的缓存没有这些字段，补拉一次并回填，避免前端只能盲选点。
+			// 注意：老版本曾把“拉过接口”当成有数据，这里以坐标是否有效为准。
+			if !activityLocationComplete(cache) && signTypeNeedsLocation(cache.SignType) {
+				// taskactivelist 里已经带了圆心就省掉一次详情请求。
+				if listLoc := a.LocationDetail(); listLoc.LocationFetched {
+					detail = mergeActivityLocation(detail, listLoc)
+					h.persistActivityLocation(a.ActiveID, detail)
+				} else if remote, err := h.xxt.GetSignDetail(user.Mobile, password, a.ActiveID); err == nil {
+					detail = mergeActivityLocation(detail, remote)
+					h.persistActivityLocation(a.ActiveID, detail)
+				} else {
+					log.Printf("backfill activity location failed: activity=%d err=%v", a.ActiveID, err)
+				}
 			}
 		} else {
 			remoteDetail, err := h.xxt.GetSignDetail(user.Mobile, password, a.ActiveID)
 			if err == nil {
-				detail = remoteDetail
+				detail = mergeActivityLocation(remoteDetail, a.LocationDetail())
 				cacheRow := model.SignActivity{
-					ActivityID:   a.ActiveID,
-					StartTime:    detail.StartTime,
-					EndTime:      detail.EndTime,
-					SignType:     detail.SignType,
-					IfRefreshEWM: detail.IfRefreshEWM,
-					IfPhoto:      detail.IfPhoto,
+					ActivityID:        a.ActiveID,
+					StartTime:         detail.StartTime,
+					EndTime:           detail.EndTime,
+					SignType:          detail.SignType,
+					IfRefreshEWM:      detail.IfRefreshEWM,
+					IfPhoto:           detail.IfPhoto,
+					IfOpenAddress:     detail.IfOpenAddress,
+					LocationLatitude:  detail.LocationLatitude,
+					LocationLongitude: detail.LocationLongitude,
+					LocationRange:     detail.LocationRange,
+					LocationAddress:   detail.LocationAddress,
+					LocationFetched:   detail.LocationFetched,
 				}
 				_ = h.db.Clauses(clause.OnConflict{
 					Columns:   []clause.Column{{Name: "activity_id"}},
@@ -168,13 +183,7 @@ func (h *SignHandler) buildCourseActivityGroup(uid int64, user model.User, passw
 			} else {
 				log.Printf("get sign detail failed: uid=%d activity=%d err=%v", uid, a.ActiveID, err)
 				if cacheFound {
-					detail = xxt.SignDetail{
-						StartTime:    cache.StartTime,
-						EndTime:      cache.EndTime,
-						SignType:     cache.SignType,
-						IfRefreshEWM: cache.IfRefreshEWM,
-						IfPhoto:      cache.IfPhoto,
-					}
+					detail = detailFromActivityCache(cache)
 				} else {
 					continue
 				}
@@ -183,17 +192,14 @@ func (h *SignHandler) buildCourseActivityGroup(uid int64, user model.User, passw
 
 		if detail.StartTime == 0 && detail.EndTime == 0 {
 			if cacheFound {
-				detail = xxt.SignDetail{
-					StartTime:    cache.StartTime,
-					EndTime:      cache.EndTime,
-					SignType:     cache.SignType,
-					IfRefreshEWM: cache.IfRefreshEWM,
-					IfPhoto:      cache.IfPhoto,
-				}
+				detail = detailFromActivityCache(cache)
 			} else {
 				continue
 			}
 		}
+
+		// 活动列表自带的定位最省事，最后再兜一次（列表没带也不影响）。
+		detail = mergeActivityLocation(detail, a.LocationDetail())
 
 		recordSourceName := ""
 		recordSource := int64(0)
@@ -232,6 +238,11 @@ func (h *SignHandler) buildCourseActivityGroup(uid int64, user model.User, passw
 			"sign_type":          detail.SignType,
 			"if_refresh_ewm":     detail.IfRefreshEWM,
 			"if_photo":           detail.IfPhoto,
+			"if_open_address":    detail.IfOpenAddress,
+			"location_latitude":  detail.LocationLatitude,
+			"location_longitude": detail.LocationLongitude,
+			"location_range":     detail.LocationRange,
+			"location_address":   detail.LocationAddress,
 			"record_source":      recordSource,
 			"record_source_name": recordSourceName,
 			"record_sign_time":   recordSignTime,
@@ -325,6 +336,9 @@ func (h *SignHandler) Execute(c *gin.Context) {
 	if req.Special == nil {
 		req.Special = map[string]interface{}{}
 	}
+	// 排查定位参数：打印后端实际收到的 special_params（含 latitude/longitude/description）。
+	log.Printf("[sign/execute] uid=%d target=%d sign_type=%d activity=%d course=%d class=%d special=%v",
+		uid, targetUID, req.SignType, req.ActivityID, req.CourseID, req.ClassID, req.Special)
 	res := h.signService.ExecuteOne(uid, service.ExecuteSignRequest{
 		ActivityID:   req.ActivityID,
 		TargetUID:    targetUID,
@@ -433,6 +447,77 @@ func (h *SignHandler) Check(c *gin.Context) {
 		return
 	}
 	common.Success(c, gin.H{"items": items})
+}
+
+// detailFromActivityCache 把活动缓存行还原成 SignDetail（含位置校验字段）。
+func detailFromActivityCache(cache model.SignActivity) xxt.SignDetail {
+	return xxt.SignDetail{
+		StartTime:         cache.StartTime,
+		EndTime:           cache.EndTime,
+		SignType:          cache.SignType,
+		IfRefreshEWM:      cache.IfRefreshEWM,
+		IfPhoto:           cache.IfPhoto,
+		IfOpenAddress:     cache.IfOpenAddress,
+		LocationLatitude:  cache.LocationLatitude,
+		LocationLongitude: cache.LocationLongitude,
+		LocationRange:     cache.LocationRange,
+		LocationAddress:   cache.LocationAddress,
+		LocationFetched:   cache.LocationFetched,
+	}
+}
+
+// signTypeNeedsLocation 判断该签到类型是否需要老师设置的签到圆心。
+// 只有二维码签到（2）和位置签到（4）会做距离校验。
+func signTypeNeedsLocation(signType int) bool {
+	return signType == xxt.SignQRCode || signType == xxt.SignLocation
+}
+
+// activityLocationComplete 判断缓存里是否已经有**可用**的签到圆心。
+// 以坐标是否有效为准，而不是只看 location_fetched 标记：
+// 早期实现只要接口请求成功就把标记置 true，导致坐标一直是 0 却再也不重试。
+func activityLocationComplete(cache model.SignActivity) bool {
+	return cache.LocationFetched && xxt.ValidLatLng(cache.LocationLatitude, cache.LocationLongitude)
+}
+
+// mergeActivityLocation 只用远端/列表里**有效**的位置字段覆盖已有值，
+// 避免空值把缓存里的好数据冲掉（列表项、详情接口经常缺字段）。
+func mergeActivityLocation(detail xxt.SignDetail, remote xxt.SignDetail) xxt.SignDetail {
+	if xxt.ValidLatLng(remote.LocationLatitude, remote.LocationLongitude) {
+		detail.LocationLatitude = remote.LocationLatitude
+		detail.LocationLongitude = remote.LocationLongitude
+		detail.LocationFetched = true
+	}
+	if remote.LocationRange > 0 {
+		detail.LocationRange = remote.LocationRange
+	}
+	if remote.LocationAddress != "" {
+		detail.LocationAddress = remote.LocationAddress
+	}
+	if remote.IfOpenAddress {
+		detail.IfOpenAddress = true
+	}
+	if remote.LocationFetched && xxt.ValidLatLng(detail.LocationLatitude, detail.LocationLongitude) {
+		detail.LocationFetched = true
+	}
+	return detail
+}
+
+// persistActivityLocation 把补拉到的位置信息写回缓存，下次列表刷新直接读库即可。
+func (h *SignHandler) persistActivityLocation(activityID int64, detail xxt.SignDetail) {
+	if !detail.LocationFetched {
+		return
+	}
+	err := h.db.Model(&model.SignActivity{}).Where("activity_id = ?", activityID).Updates(map[string]interface{}{
+		"location_fetched":   true,
+		"if_open_address":    detail.IfOpenAddress,
+		"location_latitude":  detail.LocationLatitude,
+		"location_longitude": detail.LocationLongitude,
+		"location_range":     detail.LocationRange,
+		"location_address":   detail.LocationAddress,
+	}).Error
+	if err != nil {
+		log.Printf("persist activity location failed: activity=%d err=%v", activityID, err)
+	}
 }
 
 func requiredInt64Form(c *gin.Context, key string) (int64, error) {

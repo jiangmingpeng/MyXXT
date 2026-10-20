@@ -20,6 +20,7 @@ import client from '../api/client';
 import { useAuthStore } from '../store/auth';
 import type { ApiResponse, Classmate, SignActivity, CourseActivities, SignStatusMessage, SignCheckItem } from '../types';
 import config from '../../config.yaml';
+import { useSignStore } from '../store/sign';
 
 // Import refactored components
 import { GestureInput } from '../components/sign/GestureInput';
@@ -101,6 +102,26 @@ const SignDetail = () => {
   const isExecutingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const photoPreviewUrlsRef = useRef<string[]>([]);
+
+  // 复用上次确认过的签到位置：同一间教室不需要重复选点
+  useEffect(() => {
+    if (activity?.sign_type !== 4) return;
+    const saved = useSignStore.getState().location;
+    if (!saved) return;
+    setLat(saved.lat);
+    setLng(saved.lng);
+    setLocationName(saved.name);
+    setLocationStr(saved.description);
+  }, [activity?.active_id, activity?.sign_type]);
+
+  // 选点后同时写入本地状态和共享 store（后者会落到 localStorage）
+  const applyLocation = (next: { name: string; lat: string; lng: string; description: string }) => {
+    setLat(next.lat);
+    setLng(next.lng);
+    setLocationName(next.name);
+    setLocationStr(next.description);
+    useSignStore.getState().setLocation(next);
+  };
 
   // Lock scroll when progress modal is open
   useEffect(() => {
@@ -346,11 +367,21 @@ const SignDetail = () => {
             const special_params: Record<string, any> = {};
             if (activity.sign_type === 3 || activity.sign_type === 5) special_params.sign_code = signCode;
             else if (activity.sign_type === 4) {
+              // 直接提交用户在地图上选定的坐标（GCJ-02），避免自动定位误差。
               special_params.latitude = lat;
               special_params.longitude = lng;
               special_params.description = locationStr;
             }
 
+            // 排查定位参数：打印本次真正提交给 /sign/execute 的 special_params。
+            if (attempt === 0) {
+              console.log('[sign] execute payload', JSON.stringify({
+                uid,
+                sign_type: activity.sign_type,
+                special_params,
+                pickedLocation: { lat, lng, description: locationStr },
+              }));
+            }
 
             const execResp = isPhotoSign && assignedPhotoFile
               ? await client.post<ApiResponse<any>>('/sign/photo', (() => {
@@ -609,7 +640,7 @@ const SignDetail = () => {
               <div className="flex-1 overflow-y-auto space-y-3 pr-1 pb-[calc(40px+var(--sab))] custom-scrollbar px-1">{LOCATION_PRESETS.map((p: any, i: number) => {
                 const isSelected = p.lat === lat && p.lng === lng;
                 return (
-                  <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { setLat(p.lat); setLng(p.lng); setLocationName(p.name); setLocationStr(p.description); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
+                  <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { applyLocation({ name: p.name, lat: p.lat, lng: p.lng, description: p.description }); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
                     <div className="flex-1 min-w-0 pr-4"><div className="font-bold text-slate-800 mb-0.5 text-sm">{p.name}</div><div className="text-[10px] text-slate-400 font-medium truncate">{p.description}</div></div>
                     {isSelected && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
                   </motion.div>
@@ -641,12 +672,13 @@ const SignDetail = () => {
         initialLat={lat}
         initialName={locationName}
         initialDescription={locationStr}
+        signLng={activity?.location_longitude}
+        signLat={activity?.location_latitude}
+        signRange={activity?.location_range}
+        signAddress={activity?.location_address}
         onClose={() => setIsMapPickerOpen(false)}
         onConfirm={(result) => {
-          setLat(result.lat);
-          setLng(result.lng);
-          setLocationName(result.name);
-          setLocationStr(result.description);
+          applyLocation(result);
           setIsMapPickerOpen(false);
           setIsLocationPickerOpen(false);
           toast.success('已选择地图位置');

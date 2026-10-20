@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -64,6 +65,27 @@ func main() {
 			}
 		}
 	}
+
+	// 前端静态资源：把 Web 的构建产物（Web/dist）放到可执行文件同级的 web/ 目录下。
+	// 目录结构示例：
+	//   ./xbt-server
+	//   ./config.yaml
+	//   ./web/index.html
+	//   ./web/assets/...
+	r.Static("/assets", "./web/assets")
+	r.StaticFile("/favicon.jpg", "./web/favicon.jpg")
+	r.StaticFile("/", "./web/index.html")
+
+	// 前端使用 HashRouter，浏览器实际只会请求 "/" 和 "/assets/*"。
+	// 这里兜底：非 /api 的路径回退到 index.html，避免误访问时返回 404。
+	r.NoRoute(func(c *gin.Context) {
+		p := c.Request.URL.Path
+		if p == "/api" || strings.HasPrefix(p, "/api/") {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "not found"})
+			return
+		}
+		c.File("./web/index.html")
+	})
 
 	log.Printf("xbt2 server listening on %s (app_env=%s, gin_mode=%s)", cfg.HTTPAddr, cfg.AppEnv, gin.Mode())
 	if err := r.Run(cfg.HTTPAddr); err != nil {

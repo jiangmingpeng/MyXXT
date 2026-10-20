@@ -2,7 +2,9 @@ package xxt
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	_ "image/jpeg"
@@ -46,6 +48,8 @@ type Session struct {
 	UID         int64
 	Name        string
 	Avatar      string
+	Fid         int64  // 学校（单位）id，来自登录后的 _fid cookie；二维码签到必须携带真实值。
+	DeviceCode  string // 设备标识，登录后生成一次，会话内保持稳定。
 	Jar         *cookiejar.Jar
 	LastLoginAt time.Time
 }
@@ -67,6 +71,26 @@ type Course struct {
 type Active struct {
 	ActiveID int64
 	Name     string
+	// 下面几项是 taskactivelist 里可能自带的定位信息（二维码/位置签到通常会带）。
+	// 有值时可以直接用，省掉一次 getPPTActiveInfo 请求；没有时为零值。
+	IfOpenAddress     bool
+	LocationLatitude  float64
+	LocationLongitude float64
+	LocationRange     int64
+	LocationAddress   string
+	LocationFetched   bool
+}
+
+// LocationDetail 把列表里自带的定位信息包成 SignDetail，方便和缓存/详情合并。
+func (a Active) LocationDetail() SignDetail {
+	return SignDetail{
+		IfOpenAddress:     a.IfOpenAddress,
+		LocationLatitude:  a.LocationLatitude,
+		LocationLongitude: a.LocationLongitude,
+		LocationRange:     a.LocationRange,
+		LocationAddress:   a.LocationAddress,
+		LocationFetched:   a.LocationFetched,
+	}
 }
 
 type SignDetail struct {
@@ -75,6 +99,16 @@ type SignDetail struct {
 	SignType     int
 	IfRefreshEWM bool
 	IfPhoto      bool
+	// 位置校验相关：老师在活动里设置的签到圆心与半径。
+	// 数据来自 getPPTActiveInfo（必要时回退 signDetail）；没有位置校验时为零值。
+	IfOpenAddress     bool
+	LocationLatitude  float64
+	LocationLongitude float64
+	LocationRange     int64
+	LocationAddress   string
+	// LocationFetched 表示本次是否真的查过位置信息。
+	// false 通常意味着详情接口没返回定位字段，用于决定是否需要回填缓存。
+	LocationFetched bool
 }
 
 type FixedParams struct {
@@ -175,6 +209,12 @@ func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
 		return nil, fmt.Errorf("登录后未获取到UID")
 	}
 
+	fid := fidFromJar(jar)
+	if fid == 0 {
+		// 少数账号登录后不会下发 _fid cookie，退回到 base 页面里的 fid 配置。
+		fid = fidFromHTML(s)
+	}
+
 	c.sessionMu.Lock()
 	c.sessions[mobile] = &Session{
 		Mobile:      mobile,
@@ -182,6 +222,8 @@ func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
 		UID:         uid,
 		Name:        name,
 		Avatar:      avatar,
+		Fid:         fid,
+		DeviceCode:  newDeviceCode(),
 		Jar:         jar,
 		LastLoginAt: time.Now(),
 	}
@@ -320,6 +362,7 @@ func (c *Client) GetActives(mobile, password string, courseID, classID int64) ([
 	}
 	out := make([]Active, 0)
 	seen := make(map[int64]struct{})
+	probeHits := 0
 	for _, a := range activeList {
 		activeType := int64FromAny(firstNonNil(a["activeType"], a["type"], a["atype"]))
 		name := strVal(firstNonNil(a["nameOne"], a["name"], a["activeName"], a["title"]))
@@ -337,13 +380,32 @@ func (c *Client) GetActives(mobile, password string, courseID, classID int64) ([
 		if name == "" {
 			name = fmt.Sprintf("活动 %d", id)
 		}
+		// taskactivelist 里常常直接带 locationLatitude/locationLongitude/locationRange，
+		// 先把它们解析出来；解析不到也没关系，后面还有 getPPTActiveInfo 兜底。
+		loc := SignDetail{}
+		applyLocationFields(&loc, a)
+		loc.LocationFetched = ValidLatLng(loc.LocationLatitude, loc.LocationLongitude)
+		if logLocationCandidates("activelist", id, a) {
+			probeHits++
+		}
 		out = append(out, Active{
-			ActiveID: id,
-			Name:     name,
+			ActiveID:          id,
+			Name:              name,
+			IfOpenAddress:     loc.IfOpenAddress,
+			LocationLatitude:  loc.LocationLatitude,
+			LocationLongitude: loc.LocationLongitude,
+			LocationRange:     loc.LocationRange,
+			LocationAddress:   loc.LocationAddress,
+			LocationFetched:   loc.LocationFetched,
 		})
 		if len(out) >= c.activeFetchMax {
 			break
 		}
+	}
+	// 一个定位字段都没找到时，把原始活动的顶层 key 打出来，方便判断返回结构。
+	if probeHits == 0 && len(activeList) > 0 {
+		log.Printf("[activelist] course=%d class=%d 未发现定位字段，样本顶层 key=%v",
+			courseID, classID, TopLevelKeys(activeList[0]))
 	}
 	return out, nil
 }
@@ -362,8 +424,8 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 	if err != nil {
 		return SignDetail{}, err
 	}
-	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err != nil {
 		return SignDetail{}, err
 	}
@@ -375,13 +437,170 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 	if end == 0 {
 		end = 64060559999000
 	}
-	return SignDetail{
+	detail := SignDetail{
 		StartTime:    parseTimeMillis(payload["startTime"]),
 		EndTime:      end,
 		SignType:     int(int64FromAny(payload["otherId"])),
 		IfRefreshEWM: boolFromAny(payload["ifRefreshEwm"]),
 		IfPhoto:      boolFromAny(deepFindFirst(payload, "ifphoto", "ifPhoto")),
-	}, nil
+	}
+	// signDetail 本身偶尔也带定位字段，先就地解析一次。
+	applyLocationFields(&detail, payload)
+	logLocationCandidates("signDetail", activityID, payload)
+	// 二维码签到 / 位置签到的距离校验要用到老师设置的签到圆心与半径，
+	// signDetail 多数情况下不返回，需要再拉一次 getPPTActiveInfo。
+	if detail.SignType == SignQRCode || detail.SignType == SignLocation {
+		if info, err := c.fetchActiveInfo(&cli, activityID); err != nil {
+			log.Printf("[activeInfo] activity=%d err=%v", activityID, err)
+		} else {
+			applyLocationFields(&detail, info)
+			logLocationCandidates("activeInfo", activityID, info)
+		}
+	}
+	// 只有真的解析出圆心才算补齐；否则保持 false，让下次列表刷新再拉一次
+	// （同时也会再打一次诊断日志，方便定位字段名）。
+	detail.LocationFetched = ValidLatLng(detail.LocationLatitude, detail.LocationLongitude)
+	if !detail.LocationFetched && (detail.SignType == SignQRCode || detail.SignType == SignLocation) {
+		log.Printf("[activeInfo] activity=%d 未能解析到签到圆心，前端将无法画圈 signType=%d ifopenAddress=%v range=%d",
+			activityID, detail.SignType, detail.IfOpenAddress, detail.LocationRange)
+	}
+	return detail, nil
+}
+
+// fetchActiveInfo 拉取活动详情（getPPTActiveInfo），用于读取签到圆心与半径。
+// 该接口返回结构随版本变化，这里保留原始 map 交给 applyLocationFields 做兼容解析。
+func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string]interface{}, error) {
+	u := fmt.Sprintf("https://mobilelearn.chaoxing.com/v2/apis/active/getPPTActiveInfo?activeId=%d", activityID)
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", c.mobileUA)
+	resp, err := cli.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		log.Printf("[activeInfo] activity=%d status=%d 非 JSON 返回 body=%q", activityID, resp.StatusCode,
+			truncateForLog(strings.TrimSpace(string(raw)), 300))
+		return nil, err
+	}
+	// 完整原始返回只截断到 2000 字符，必要时能看到 data 里的字段名。
+	log.Printf("[activeInfo] activity=%d status=%d body=%q", activityID, resp.StatusCode,
+		truncateForLog(strings.TrimSpace(string(raw)), 2000))
+	return payload, nil
+}
+
+// locationProbeRe 命中“可能和定位有关”的 JSON 路径，用于诊断日志。
+var locationProbeRe = regexp.MustCompile(`(?i)(lat|lng|lon|range|radius|address|location|distance|geo)`)
+
+// logLocationCandidates 打印返回里所有疑似定位字段的“路径=值”，
+// 这样即使真实字段名和我们猜的不一样，也能一眼看出来。返回是否命中。
+func logLocationCandidates(tag string, activityID int64, payload interface{}) bool {
+	if payload == nil {
+		return false
+	}
+	hits := make([]string, 0, 16)
+	for _, pair := range JSONLeafPairs(payload, 200) {
+		if idx := strings.Index(pair, "="); idx > 0 && locationProbeRe.MatchString(pair[:idx]) {
+			hits = append(hits, pair)
+		}
+	}
+	if len(hits) == 0 {
+		return false
+	}
+	log.Printf("[%s] activity=%d 疑似定位字段: %s", tag, activityID, strings.Join(hits, ", "))
+	return true
+}
+
+// 学习通不同接口/版本里定位字段名不一致，这里按优先级列出候选名。
+// 同时覆盖大小写变体（部分老接口返回全小写）。
+var (
+	locationLatKeys = []string{
+		"locationLatitude", "locationlatitude", "activeLatitude", "signLatitude",
+		"latitude",
+	}
+	locationLngKeys = []string{
+		"locationLongitude", "locationlongitude", "activeLongitude", "signLongitude",
+		"longitude",
+	}
+	locationRangeKeys = []string{
+		"locationRange", "locationrange", "activeRange", "signRange",
+		"radius", "range",
+	}
+	locationAddrKeys = []string{
+		"locationAddress", "locationaddress", "activeAddress", "signAddress",
+		"address", "location",
+	}
+	locationOpenKeys = []string{
+		"ifopenAddress", "ifopenaddress", "ifOpenAddress",
+		"ifopenLocation", "ifOpenLocation", "openAddress",
+	}
+)
+
+// applyLocationFields 从活动详情 JSON 中解析签到圆心/半径/地址，写回 SignDetail。
+// 多来源（signDetail / getPPTActiveInfo）可以重复调用，非零值会覆盖旧值。
+func applyLocationFields(detail *SignDetail, payload map[string]interface{}) {
+	if detail == nil || len(payload) == 0 {
+		return
+	}
+	if lat, ok := floatFromAny(deepFindFirst(payload, locationLatKeys...)); ok {
+		if lng, ok2 := floatFromAny(deepFindFirst(payload, locationLngKeys...)); ok2 {
+			// 0 或超范围视为无效，避免把空字段当成北京天安门外的海面坐标。
+			if ValidLatLng(lat, lng) {
+				detail.LocationLatitude = lat
+				detail.LocationLongitude = lng
+			}
+		}
+	}
+	if rng := int64FromAny(deepFindFirst(payload, locationRangeKeys...)); rng > 0 {
+		detail.LocationRange = rng
+	}
+	if addr := locationAddressValue(deepFindFirst(payload, locationAddrKeys...)); addr != "" {
+		detail.LocationAddress = addr
+	}
+	if open, ok := firstBoolField(payload, locationOpenKeys...); ok {
+		detail.IfOpenAddress = open
+	} else if detail.LocationRange > 0 || ValidLatLng(detail.LocationLatitude, detail.LocationLongitude) {
+		// 没显式声明时，只要拿到了圆心/半径就认为该活动启用了位置校验。
+		detail.IfOpenAddress = true
+	}
+}
+
+// firstBoolField 按候选名顺序查找布尔字段，返回 (值, 是否存在)。
+func firstBoolField(payload map[string]interface{}, keys ...string) (bool, bool) {
+	for _, k := range keys {
+		raw, ok := deepFindKey(payload, k)
+		if !ok {
+			continue
+		}
+		return boolFromAny(raw), true
+	}
+	return false, false
+}
+
+// ValidLatLng 判断经纬度是否是有效的非零坐标。
+func ValidLatLng(lat, lng float64) bool {
+	if lat == 0 && lng == 0 {
+		return false
+	}
+	return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
+}
+
+// locationAddressValue 只接受字符串形态的地址，避免把嵌套对象转成 "map[...]"。
+func locationAddressValue(v interface{}) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "map[") {
+		return ""
+	}
+	return s
 }
 
 func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc string) error {
@@ -597,14 +816,44 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 			return "", fmt.Errorf("缺少二维码 enc 参数")
 		}
 		params.Set("enc", enc)
+		// 学习通二维码签到要求携带账号所属学校的真实 fid。
+		// 空 fid 会被判为无效请求（返回“签到失败，请重新扫描。”）。
+		if s.Fid > 0 {
+			params.Set("fid", strconv.FormatInt(s.Fid, 10))
+		}
+		if fixed.CourseID > 0 {
+			params.Set("courseId", strconv.FormatInt(fixed.CourseID, 10))
+		}
+		// 设备标识与反作弊参数：与 ChaoxingSignFaker 的二维码签到请求保持一致。
+		if s.DeviceCode != "" {
+			params.Set("deviceCode", s.DeviceCode)
+		}
+		params.Set("vpProbability", "-1")
+		params.Set("vpStrategy", "")
 		// 兼容 1.0 的二维码附加位置变种：透传 location 给学习通。
 		// 兼容两种输入：
 		// 1) special.location（1.0 旧格式）
 		// 2) special.latitude/longitude/description（2.0 前端当前格式）
 		if locationJSON, ok := buildQRCodeLocationParam(special); ok {
 			params.Set("location", locationJSON)
+			// locationResult 是学习通要求的第二个定位参数：
+			// 结构与 location 相同，额外携带 mockData 字符串（声明未使用模拟定位）。
+			if locResult, ok := buildQRCodeLocationResultParam(special); ok {
+				params.Set("locationResult", locResult)
+			}
+			// 排查定位参数：确认二维码签到实际下发的 location JSON。
+			log.Printf("[sign/qrcode] activity=%d uid=%d fid=%d deviceCode=%s location=%s locationResult=%s",
+				fixed.ActiveID, fixed.UID, s.Fid, truncateForLog(s.DeviceCode, 12),
+				truncateForLog(locationJSON, 500), truncateForLog(params.Get("locationResult"), 500))
+		} else {
+			// 没有 location 时学习通只会收到 latitude=-1&longitude=-1，极易返回 errorLocation3。
+			log.Printf("[sign/qrcode] activity=%d uid=%d location=MISSING latitude=%q longitude=%q description=%q",
+				fixed.ActiveID, fixed.UID,
+				strVal(special["latitude"]), strVal(special["longitude"]), strVal(special["description"]))
 		}
-		params.Set("useragent", "")
+		// 参考实现（ChaoxingSignFaker）的二维码签到不携带 useragent 参数，
+		// 空 useragent 反而可能被学习通当作异常客户端。
+		params.Del("useragent")
 		params.Set("latitude", "-1")
 		params.Set("longitude", "-1")
 	case SignGesture, SignCode:
@@ -639,6 +888,9 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 		params.Set("address", strVal(special["description"]))
 		params.Set("latitude", strVal(special["latitude"]))
 		params.Set("longitude", strVal(special["longitude"]))
+		if accStr := strings.TrimSpace(strVal(special["accuracy"])); accStr != "" {
+			params.Set("accuracy", accStr)
+		}
 		params.Set("ifTiJiao", "1")
 	default:
 		params.Set("latitude", "-1")
@@ -695,11 +947,15 @@ func (c *Client) doStuSignRequest(cli *http.Client, params url.Values) (string, 
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := strings.TrimSpace(string(body))
-	// 便于排查二维码 enc 失效等场景：打印学习通原始返回。
-	log.Printf("[stuSignajax] activeId=%s uid=%s enc=%s validate=%t body=%q",
+	// 便于排查二维码 enc 失效、定位参数缺失等场景：打印学习通原始返回。
+	log.Printf("[stuSignajax] activeId=%s uid=%s enc=%s validate=%t location=%s latitude=%q longitude=%q body=%q",
 		params.Get("activeId"), params.Get("uid"),
 		truncateForLog(params.Get("enc"), 24), params.Get("validate") != "",
-		truncateForLog(bodyStr, 300))
+		truncateForLog(params.Get("location"), 600),
+		params.Get("latitude"), params.Get("longitude"),
+		truncateForLog(bodyStr, 500))
+	// 完整 query（含 location）便于对照学习通定位校验。
+	log.Printf("[stuSignajax] full_query=%s", truncateForLog(params.Encode(), 2000))
 	return bodyStr, nil
 }
 
@@ -759,17 +1015,55 @@ func escapeMultipartFilename(filename string) string {
 	return strings.NewReplacer("\\", "\\\\", `"`, "\\\"").Replace(filename)
 }
 
+// locationMockDataJSON 是学习通定位结构里的反模拟定位声明：
+// strategy=0（默认策略）、probability=-1（未检测到伪造定位）。
+// 只有 locationResult 参数会携带它，location 参数不带。
+const locationMockDataJSON = `{"strategy":0,"probability":-1}`
+
+// buildQRCodeLocationParam 生成 stuSignajax 的 location 参数（不带 mockData）。
 func buildQRCodeLocationParam(special map[string]interface{}) (string, bool) {
+	return buildQRCodeLocationPayload(special, false)
+}
+
+// buildQRCodeLocationResultParam 生成 stuSignajax 的 locationResult 参数（带 mockData）。
+func buildQRCodeLocationResultParam(special map[string]interface{}) (string, bool) {
+	return buildQRCodeLocationPayload(special, true)
+}
+
+// buildQRCodeLocationPayload 生成学习通二维码签到的定位 JSON。
+// 结构对齐 ChaoxingSignFaker 的 addLocationDataParameter：
+//
+//	{"result":1,"latitude":30.1,"longitude":120.2,"address":"..."}            // location
+//	{"result":1,"latitude":30.1,"longitude":120.2,"address":"...","mockData":"{\"strategy\":0,\"probability\":-1}"} // locationResult
+//
+// 注意：
+//   - result 必须是整数 1（字符串或缺失都会让服务端判为无效定位）；
+//   - 没有 altitude 字段；
+//   - mockData 是“JSON 字符串”而不是对象，且只在 locationResult 中携带。
+func buildQRCodeLocationPayload(special map[string]interface{}, withMockData bool) (string, bool) {
 	if locRaw, ok := special["location"]; ok && locRaw != nil {
+		var raw string
 		switch v := locRaw.(type) {
 		case string:
-			if strings.TrimSpace(v) != "" {
-				return v, true
-			}
+			raw = strings.TrimSpace(v)
 		default:
 			if b, err := json.Marshal(v); err == nil && string(b) != "null" && string(b) != `""` {
-				return string(b), true
+				raw = string(b)
 			}
+		}
+		if raw != "" {
+			if !withMockData {
+				return raw, true
+			}
+			// 1.0 透传的 location 需要补上 mockData 才能作为 locationResult 使用。
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+				payload["mockData"] = locationMockDataJSON
+				if b, err := json.Marshal(payload); err == nil {
+					return string(b), true
+				}
+			}
+			return raw, true
 		}
 	}
 
@@ -794,10 +1088,8 @@ func buildQRCodeLocationParam(special map[string]interface{}) (string, bool) {
 	} else if lngStr != "" {
 		location["longitude"] = lngStr
 	}
-	if desc != "" {
-		location["mockData"] = map[string]interface{}{
-			"description": desc,
-		}
+	if withMockData {
+		location["mockData"] = locationMockDataJSON
 	}
 
 	b, err := json.Marshal(location)
@@ -805,4 +1097,54 @@ func buildQRCodeLocationParam(special map[string]interface{}) (string, bool) {
 		return "", false
 	}
 	return string(b), true
+}
+
+// fidFromJar 从登录后的 cookie 中解析账号所属学校（单位）id。
+// 学习通登录后会在 i.chaoxing.com / passport2.chaoxing.com 下写入 _fid（部分账号为 fid）。
+func fidFromJar(jar *cookiejar.Jar) int64 {
+	if jar == nil {
+		return 0
+	}
+	hosts := []string{
+		"i.chaoxing.com",
+		"passport2.chaoxing.com",
+		"passport.chaoxing.com",
+		"mobilelearn.chaoxing.com",
+	}
+	for _, host := range hosts {
+		for _, ck := range jar.Cookies(&url.URL{Scheme: "https", Host: host}) {
+			if ck.Name != "_fid" && ck.Name != "fid" {
+				continue
+			}
+			if v, err := strconv.ParseInt(strings.TrimSpace(ck.Value), 10, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
+// fidFromHTML 从登录后的 i.chaoxing.com/base 页面里兜底解析 fid。
+// 页面里常见写法：var _fid = "12345"; / "fid":12345 / fid='12345'。
+var fidFromHTMLRe = regexp.MustCompile(`(?i)(?:_fid|"fid"|'fid'|\bfid)\s*[:=]\s*["']?(\d{3,})`)
+
+func fidFromHTML(html string) int64 {
+	m := fidFromHTMLRe.FindStringSubmatch(html)
+	if len(m) < 2 {
+		return 0
+	}
+	v, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
+}
+
+// newDeviceCode 生成一次设备标识（32 位小写 hex），会话内保持不变。
+func newDeviceCode() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%032x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }

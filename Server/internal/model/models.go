@@ -45,15 +45,23 @@ type UserCourse struct {
 }
 
 type SignActivity struct {
-	ID           uint      `gorm:"primaryKey" json:"-"`
-	ActivityID   int64     `gorm:"unique;not null" json:"activity_id"`
-	StartTime    int64     `gorm:"not null" json:"start_time"`
-	EndTime      int64     `gorm:"not null" json:"end_time"`
-	SignType     int       `gorm:"not null" json:"sign_type"`
-	IfRefreshEWM bool      `gorm:"not null;default:false" json:"if_refresh_ewm"`
-	IfPhoto      bool      `gorm:"not null;default:false" json:"if_photo"`
-	CreatedAt    time.Time `json:"-"`
-	UpdatedAt    time.Time `json:"-"`
+	ID           uint  `gorm:"primaryKey" json:"-"`
+	ActivityID   int64 `gorm:"unique;not null" json:"activity_id"`
+	StartTime    int64 `gorm:"not null" json:"start_time"`
+	EndTime      int64 `gorm:"not null" json:"end_time"`
+	SignType     int   `gorm:"not null" json:"sign_type"`
+	IfRefreshEWM bool  `gorm:"not null;default:false" json:"if_refresh_ewm"`
+	IfPhoto      bool  `gorm:"not null;default:false" json:"if_photo"`
+	// 位置校验：老师在活动里设置的签到圆心、半径与地址。
+	IfOpenAddress     bool    `gorm:"not null;default:false" json:"if_open_address"`
+	LocationLatitude  float64 `gorm:"not null;default:0" json:"location_latitude"`
+	LocationLongitude float64 `gorm:"not null;default:0" json:"location_longitude"`
+	LocationRange     int64   `gorm:"not null;default:0" json:"location_range"`
+	LocationAddress   string  `gorm:"size:255" json:"location_address"`
+	// LocationFetched 标记是否已向学习通查过位置信息（老缓存升级后需要补拉一次）。
+	LocationFetched bool      `gorm:"not null;default:false" json:"-"`
+	CreatedAt       time.Time `json:"-"`
+	UpdatedAt       time.Time `json:"-"`
 }
 
 type SignRecord struct {

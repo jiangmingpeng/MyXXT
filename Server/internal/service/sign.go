@@ -324,6 +324,11 @@ func (s *SignService) toUserSignMessage(raw string) string {
 	}
 
 	lower := strings.ToLower(msg)
+	// 学习通的定位校验失败（errorLocation3 / errorLocation_xxx）需要单独翻译：
+	// 这类返回说明定位参数已被接受，只是坐标不在老师设置的签到范围内。
+	if hint := xxt.ExplainLocationError(msg); hint != "" {
+		return hint
+	}
 	switch {
 	case msg == "validate" || strings.Contains(lower, "validate"):
 		return "签到校验未通过，请重试"

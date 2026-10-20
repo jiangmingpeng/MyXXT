@@ -6,7 +6,11 @@ import { Html5Qrcode, type CameraDevice } from 'html5-qrcode';
 import toast from 'react-hot-toast';
 import client from '../api/client';
 import { useAuthStore } from '../store/auth';
+import { useSignStore } from '../store/sign';
+import { distanceMeters } from '../utils/coord';
 import { ProgressCard } from '../components/sign/ProgressCard';
+import { MapPicker } from '../components/sign/MapPicker';
+import type { MapPickerResult } from '../components/sign/MapPicker';
 import type { ApiResponse, SignStatusMessage, Classmate, User, SignExecuteResult } from '../types';
 import { SIGN_ERR_QR_EXPIRED } from '../constants';
 import scanCursor from '../assets/scan_cursor.png';
@@ -33,6 +37,25 @@ type NativeCameraBridge = {
 
 type WindowWithBridge = Window & {
   XBTCameraBridge?: NativeCameraBridge;
+};
+
+/**
+ * 判断已选位置是否落在老师设置的签到半径之外。
+ * 学习通对二维码签到做距离校验（常见 500/1000 米），
+ * 超出范围时提交一定会失败，需要先让用户重新选点。
+ */
+const isLocationOutsideSignRange = (
+  loc: { lng: string | number; lat: string | number } | null | undefined,
+  centerLat?: number,
+  centerLng?: number,
+  range?: number
+): boolean => {
+  if (!loc || !centerLat || !centerLng || !range || range <= 0) return false;
+  const lng = Number(loc.lng);
+  const lat = Number(loc.lat);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return false;
+  const distance = distanceMeters({ lng, lat }, { lng: centerLng, lat: centerLat });
+  return Number.isFinite(distance) && distance > range;
 };
 
 const getFriendlyCameraLabel = (camera: CameraDevice, index: number) => {
@@ -96,14 +119,19 @@ const FullScanner = () => {
     }
   }, [isCameraReady, cameraError]);
 
-  const [lat, setLat] = useState('');
-  const [lng, setLng] = useState('');
-  const [locationStr, setLocationStr] = useState('');
+  // 签到位置：内存 store 负责组件同步，localStorage 负责下次进入页面直接复用
+  const pickedLocation = useSignStore((state) => state.location);
+  const locationDecided = useSignStore((state) => state.decided);
+  const setPickedLocation = useSignStore((state) => state.setLocation);
+  const clearPickedLocation = useSignStore((state) => state.clearLocation);
   const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
-
-  const latRef = useRef('');
-  const lngRef = useRef('');
-  const locationStrRef = useRef('');
+  const [isMapPickerOpen, setIsMapPickerOpen] = useState(false);
+  const isMapPickerOpenRef = useRef(false);
+  const isLocationSheetOpenRef = useRef(false);
+  // 扫码时还没选点：暂存二维码，用户选完点后立即提交
+  const pendingQrRef = useRef<QrData | null>(null);
+  // 用户主动取消过地图选点后，不再自动弹窗，避免每次都打断扫码
+  const skipAutoLocationPickerRef = useRef(false);
   const lastScanTimeRef = useRef<number>(0);
   const lastScanDetectedRef = useRef<number>(0);
   const lastScanFailToastRef = useRef<number>(0);
@@ -112,10 +140,9 @@ const FullScanner = () => {
   const [isDecodingImage, setIsDecodingImage] = useState(false);
 
   useEffect(() => {
-    latRef.current = lat;
-    lngRef.current = lng;
-    locationStrRef.current = locationStr;
-  }, [lat, lng, locationStr]);
+    isMapPickerOpenRef.current = isMapPickerOpen;
+    isLocationSheetOpenRef.current = isLocationPickerOpen;
+  }, [isMapPickerOpen, isLocationPickerOpen]);
   
   useEffect(() => {
     const handleFullScreen = async () => {
@@ -174,6 +201,18 @@ const FullScanner = () => {
   const selectedDeviceIdRef = useRef<string | null>(null);
 
   const { activity, selectedUids, classmates } = location.state || {};
+
+  // 老师设置的签到圆心/半径（后端解析 getPPTActiveInfo 得到）。
+  // 有值时地图会画半径圈；已选点若落在圈外，扫码后先引导重新选点。
+  const signCenterLat = Number(activity?.location_latitude) || 0;
+  const signCenterLng = Number(activity?.location_longitude) || 0;
+  const signRangeMeters = Number(activity?.location_range) || 0;
+  const pickedLocationOutOfRange = isLocationOutsideSignRange(
+    pickedLocation,
+    signCenterLat,
+    signCenterLng,
+    signRangeMeters
+  );
   const latestQrDataRef = useRef<QrData | null>(null);
   const qrExpiredRef = useRef(false);
   const handlePasteRef = useRef<(event: ClipboardEvent) => void>(() => {});
@@ -629,7 +668,11 @@ const FullScanner = () => {
     isExecutingRef.current = true;
     const controller = new AbortController();
     abortControllerRef.current = controller;
-    
+
+    // 扫码成功的瞬间同步读取已确认的签到位置：
+    // 不依赖 React 渲染，也不发起任何定位请求，拿到 enc 后立即提交，抢在过期前完成。
+    const submitLocation = useSignStore.getState().location;
+
     const initialStatuses: Record<number, any> = {};
     orderedTargetUids.forEach(uid => initialStatuses[uid] = { status: 'pending', message: '等待中' });
     setSignStatuses(initialStatuses);
@@ -677,10 +720,21 @@ const FullScanner = () => {
             // 定时刷新二维码需要沿用链接里的查询策略（PRIMARY_KEY + id），静态码为空则不带。
             if (currentQr.dbStrategy) special_params.db_strategy = currentQr.dbStrategy;
             if (currentQr.strategyPara) special_params.strategy_para = currentQr.strategyPara;
-            if (latRef.current && lngRef.current) {
-              special_params.latitude = latRef.current;
-              special_params.longitude = lngRef.current;
-              special_params.description = locationStrRef.current;
+            // 直接提交用户提前在地图上确认的坐标（GCJ-02），
+            // 不再依赖误差较大的自动定位。
+            if (submitLocation) {
+              special_params.latitude = submitLocation.lat;
+              special_params.longitude = submitLocation.lng;
+              special_params.description = submitLocation.description;
+            }
+            // 排查定位参数：打印本次真正提交给 /sign/execute 的 special_params。
+            if (attempt === 0) {
+              console.log('[sign] execute payload', JSON.stringify({
+                uid,
+                sign_type: 2,
+                special_params,
+                pickedLocation: submitLocation,
+              }));
             }
             const execResp = await client.post<ApiResponse<SignExecuteResult>>('/sign/execute', {
               activity_id: activity.active_id, target_uid: uid, sign_type: 2,
@@ -735,6 +789,62 @@ const FullScanner = () => {
     }
   };
 
+  // 地图选点确认：写入 store（同时落到 localStorage）；
+  // 若扫码时因尚未选点被挂起，选完立即提交，缩短 enc 的过期窗口。
+  const handleMapLocationConfirm = (result: MapPickerResult) => {
+    skipAutoLocationPickerRef.current = false;
+    setPickedLocation({
+      name: result.name,
+      lat: result.lat,
+      lng: result.lng,
+      description: result.description,
+    });
+    setIsMapPickerOpen(false);
+    setIsLocationPickerOpen(false);
+    toast.success('已设置签到位置', { id: 'sign-location' });
+
+    const pending = pendingQrRef.current;
+    pendingQrRef.current = null;
+    if (pending) {
+      handleExecute(pending);
+    }
+  };
+
+  // 统一入口：已明确选择过位置（含“不使用位置”）直接提交；
+  // 否则暂存二维码并弹出地图选点，确认后立即提交。
+  // 位置校验类活动（有老师圆心+半径）额外检查：已选点超出半径时先让用户重选，
+  // 避免用必然失败的坐标反复重试。
+  const ensureLocationAndExecute = (qr: QrData) => {
+    const state = useSignStore.getState();
+    const outsideRange = isLocationOutsideSignRange(
+      state.location,
+      Number(activity?.location_latitude),
+      Number(activity?.location_longitude),
+      Number(activity?.location_range)
+    );
+
+    if (state.decided && !outsideRange) {
+      handleExecute(qr);
+      return;
+    }
+
+    if (outsideRange) {
+      skipAutoLocationPickerRef.current = false;
+      toast(`上次选的位置超出本次签到范围，请重新选点`, { icon: '📍', id: 'sign-location-range' });
+    }
+
+    // 选点期间持续扫描到的新 enc 只更新挂起数据，避免重复弹窗
+    pendingQrRef.current = qr;
+    latestQrDataRef.current = qr;
+    setLatestQrData(qr);
+
+    // 用户取消过、或正在手动选择位置时，不再自动弹出地图
+    if (skipAutoLocationPickerRef.current || isMapPickerOpenRef.current || isLocationSheetOpenRef.current) return;
+
+    isMapPickerOpenRef.current = true;
+    setIsMapPickerOpen(true);
+  };
+
   // 从图片文件中解码二维码文本（相册导入与剪贴板图片共用）
   const decodeQrTextFromFile = async (file: File): Promise<string | null> => {
     const reader = await getZxingReader();
@@ -766,7 +876,7 @@ const FullScanner = () => {
       setIsExecuting(false);
       isExecutingRef.current = false;
     }
-    await handleExecute(qr);
+    ensureLocationAndExecute(qr);
   };
 
   const onScanSuccess = (decodedText: string) => {
@@ -793,7 +903,7 @@ const FullScanner = () => {
         setIsExecuting(false);
         isExecutingRef.current = false;
         lastScanTimeRef.current = now;
-        handleExecute(qr);
+        ensureLocationAndExecute(qr);
         return;
       }
     }
@@ -801,7 +911,7 @@ const FullScanner = () => {
     // 只在非执行态、且满足 2s 节流时才触发一次新的签到流程
     if (isExecuting || isExecutingRef.current || (now - lastScanTimeRef.current < 2000)) return;
     lastScanTimeRef.current = now;
-    handleExecute(qr);
+    ensureLocationAndExecute(qr);
   };
 
   useEffect(() => {
@@ -1096,6 +1206,35 @@ const FullScanner = () => {
         <h2 className="text-[20px] font-normal tracking-widest">扫一扫</h2>
       </div>
 
+      {/* 当前签到位置：进入页面先确认，扫码成功后立即随 enc 提交 */}
+      {!isStealthMode && !isExecuting && (
+        <div className="absolute top-[calc(84px+var(--sat))] left-1/2 -translate-x-1/2 z-40 w-[88%]">
+          <button
+            type="button"
+            onClick={() => {
+              skipAutoLocationPickerRef.current = false;
+              pendingQrRef.current = null;
+              setIsLocationPickerOpen(true);
+            }}
+            className={`w-full flex items-center gap-2.5 px-4 py-2 rounded-2xl backdrop-blur-md border shadow-lg active:scale-[0.99] transition-transform ${pickedLocation ? 'bg-black/50 border-white/15 text-white' : 'bg-amber-500/95 border-amber-200/40 text-white'}`}
+          >
+            <MapPin size={18} className="shrink-0" />
+            <span className="flex-1 min-w-0 text-left">
+              <span className="block text-[9px] font-bold tracking-widest opacity-75 leading-tight">当前签到位置</span>
+              <span className="block text-[13px] font-bold truncate leading-tight">
+                {pickedLocation ? pickedLocation.name : (locationDecided ? '不使用位置' : '未设置，点击选择')}
+              </span>
+              {pickedLocationOutOfRange && (
+                <span className="block text-[10px] font-bold text-amber-300 leading-tight">
+                  超出 {signRangeMeters} 米签到范围，点击重选
+                </span>
+              )}
+            </span>
+            <span className="text-[10px] font-bold opacity-80 shrink-0">{pickedLocation ? '更换' : '选择'}</span>
+          </button>
+        </div>
+      )}
+
       {/* 相机不可用提示：引导使用相册导入 */}
       <AnimatePresence>
         {cameraError && (
@@ -1104,7 +1243,7 @@ const FullScanner = () => {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
-            className="absolute top-[calc(84px+var(--sat))] left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-full bg-black/60 backdrop-blur-sm border border-white/15 text-white text-xs font-bold tracking-wide text-center max-w-[88%] pointer-events-none"
+            className="absolute top-[calc(132px+var(--sat))] left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-full bg-black/60 backdrop-blur-sm border border-white/15 text-white text-xs font-bold tracking-wide text-center max-w-[88%] pointer-events-none"
           >
             {cameraError}
           </motion.div>
@@ -1119,7 +1258,7 @@ const FullScanner = () => {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
-            className={`absolute left-1/2 -translate-x-1/2 z-40 w-[88%] rounded-2xl bg-rose-500/95 backdrop-blur-sm px-4 py-2.5 text-white shadow-lg pointer-events-none ${cameraError ? 'top-[calc(132px+var(--sat))]' : 'top-[calc(84px+var(--sat))]'}`}
+            className={`absolute left-1/2 -translate-x-1/2 z-40 w-[88%] rounded-2xl bg-rose-500/95 backdrop-blur-sm px-4 py-2.5 text-white shadow-lg pointer-events-none ${cameraError ? 'top-[calc(180px+var(--sat))]' : 'top-[calc(132px+var(--sat))]'}`}
           >
             <p className="text-xs font-bold">二维码已过期</p>
             <p className="text-[11px] opacity-90 mt-0.5">请重新复制二维码链接或截图后粘贴，也可点左下角「相册」导入</p>
@@ -1256,14 +1395,18 @@ const FullScanner = () => {
                   exit={{ x: -120, opacity: 0 }}
                   transition={{ ease: "easeInOut", duration: 0.3, delay: 0.1 }}
                   type="button" 
-                  onClick={() => setIsLocationPickerOpen(true)} 
+                  onClick={() => {
+                    skipAutoLocationPickerRef.current = false;
+                    pendingQrRef.current = null;
+                    setIsLocationPickerOpen(true);
+                  }} 
                   className="flex flex-col items-center space-y-2 group pointer-events-auto active:scale-95 transition-transform"
                 >
-                  <div className={`w-14 h-14 rounded-full flex items-center justify-center backdrop-blur-md border border-white/10 shadow-lg transition-colors ${lat ? 'bg-blue-600 text-white' : 'bg-black/40 text-white'}`}>
+                  <div className={`w-14 h-14 rounded-full flex items-center justify-center backdrop-blur-md border border-white/10 shadow-lg transition-colors ${pickedLocation ? 'bg-blue-600 text-white' : 'bg-black/40 text-white'}`}>
                     <MapPin size={22} />
                   </div>
                   <span className="text-[10px] text-white/80 font-bold tracking-wider truncate max-w-[60px]">
-                    {lat ? LOCATION_PRESETS.find((p: any) => p.lat === lat)?.name || "位置" : "位置"}
+                    {pickedLocation ? pickedLocation.name : (locationDecided ? "不使用" : "位置")}
                   </span>
                 </motion.button>
 
@@ -1308,36 +1451,64 @@ const FullScanner = () => {
 
       <AnimatePresence>
         {isLocationPickerOpen && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[150] flex items-end justify-center bg-slate-900/60 backdrop-blur-md p-0" onClick={() => setIsLocationPickerOpen(false)}>
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[105] flex items-end justify-center bg-slate-900/60 backdrop-blur-md p-0" onClick={() => setIsLocationPickerOpen(false)}>
             <motion.div initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }} transition={{ type: 'spring', damping: 28, stiffness: 250 }} className="bg-white w-full max-w-[480px] rounded-t-[3rem] p-8 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]" onClick={(e) => e.stopPropagation()}>
               <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-8 shrink-0" />
               <div className="flex items-center justify-between mb-6 shrink-0"><h3 className="text-xl font-bold text-slate-900">选择签到位置</h3><button onClick={() => setIsLocationPickerOpen(false)} className="w-8 h-8 flex items-center justify-center bg-slate-100 text-slate-400 rounded-full">✕</button></div>
+              <button
+                type="button"
+                onClick={() => { skipAutoLocationPickerRef.current = false; setIsMapPickerOpen(true); }}
+                className="w-full mb-4 py-3 rounded-2xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-600/20 active:scale-[0.98] transition-transform shrink-0"
+              >
+                <MapPin size={18} />
+                高德地图选点
+              </button>
               <div className="flex-1 overflow-y-auto space-y-3 pr-1 pb-[calc(40px+var(--sab))] custom-scrollbar px-1">
-                <motion.div 
-                  whileTap={{ scale: 0.98 }} 
-                  onClick={() => { setLat(''); setLng(''); setLocationStr(''); setIsLocationPickerOpen(false); }} 
-                  className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${!lat ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-100/50 hover:bg-white'}`}
+                <motion.div
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => { clearPickedLocation(); setIsLocationPickerOpen(false); }}
+                  className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${locationDecided && !pickedLocation ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-100/50 hover:bg-white'}`}
                 >
                   <div className="flex-1 min-w-0 pr-4">
                     <div className="font-bold text-slate-800 text-sm">不使用位置</div>
                     <div className="text-[10px] text-slate-400 font-medium">不发送地理位置信息进行签到</div>
                   </div>
-                  {!lat && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
+                  {locationDecided && !pickedLocation && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
                 </motion.div>
 
                 {LOCATION_PRESETS.map((p: any, i: number) => {
-                const isSelected = p.lat === lat && p.lng === lng;
-                return (
-                  <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { setLat(p.lat); setLng(p.lng); setLocationStr(p.description); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
-                    <div className="flex-1 min-w-0 pr-4"><div className="font-bold text-slate-800 mb-0.5 text-sm">{p.name}</div><div className="text-[10px] text-slate-400 font-medium truncate">{p.description}</div></div>
-                    {isSelected && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
-                  </motion.div>
-                );
-              })}</div>
+                  const isSelected = pickedLocation?.lat === p.lat && pickedLocation?.lng === p.lng;
+                  return (
+                    <motion.div key={i} whileTap={{ scale: 0.98 }} onClick={() => { setPickedLocation({ name: p.name, lat: p.lat, lng: p.lng, description: p.description }); setIsLocationPickerOpen(false); }} className={`p-5 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50/30' : 'border-slate-50 bg-slate-50/50 hover:bg-white'}`}>
+                      <div className="flex-1 min-w-0 pr-4"><div className="font-bold text-slate-800 mb-0.5 text-sm">{p.name}</div><div className="text-[10px] text-slate-400 font-medium truncate">{p.description}</div></div>
+                      {isSelected && <CheckCircle2 size={20} className="text-blue-600 shrink-0" />}
+                    </motion.div>
+                  );
+                })}</div>
             </motion.div>
           </motion.div>
         )}
       </AnimatePresence>
+
+      <MapPicker
+        open={isMapPickerOpen}
+        initialLng={pickedLocationOutOfRange ? undefined : pickedLocation?.lng}
+        initialLat={pickedLocationOutOfRange ? undefined : pickedLocation?.lat}
+        initialName={pickedLocationOutOfRange ? undefined : pickedLocation?.name}
+        initialDescription={pickedLocationOutOfRange ? undefined : pickedLocation?.description}
+        signLng={activity?.location_longitude}
+        signLat={activity?.location_latitude}
+        signRange={activity?.location_range}
+        signAddress={activity?.location_address}
+        onClose={() => {
+          setIsMapPickerOpen(false);
+          // 取消兜底选点：丢弃挂起的二维码，避免用旧 enc 继续提交，
+          // 同时不再自动弹窗，等用户主动点「位置」再选。
+          skipAutoLocationPickerRef.current = true;
+          pendingQrRef.current = null;
+        }}
+        onConfirm={handleMapLocationConfirm}
+      />
 
       <AnimatePresence initial={false}>
         {isStealthMode && isAllSuccess && (

@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { LocateFixed, Loader2, MapPin, Search, X } from 'lucide-react';
+import { LocateFixed, Loader2, MapPin, Search, Target, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 import config from '../../../config.yaml';
-import { formatCoord, wgs84ToGcj02 } from '../../utils/coord';
+import { distanceMeters, formatCoord, wgs84ToGcj02 } from '../../utils/coord';
 import type { LngLat } from '../../utils/coord';
 
 const AMAP_KEY: string = config.sign?.amap?.js_key || '';
@@ -31,6 +31,12 @@ interface MapPickerProps {
   initialLat?: string;
   initialName?: string;
   initialDescription?: string;
+  /** 老师设置的签到圆心（GCJ-02），用于画半径圈和"用签到点"快捷定位 */
+  signLng?: number | string;
+  signLat?: number | string;
+  /** 老师设置的签到半径（米） */
+  signRange?: number;
+  signAddress?: string;
   onClose: () => void;
   onConfirm: (result: MapPickerResult) => void;
 }
@@ -55,12 +61,35 @@ const safeNumber = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(value) ? value : fallback;
 };
 
+/** 把后端返回的 number/string 经纬度转成 LngLat；0 或非法值视为没有 */
+const toLngLat = (lng?: number | string, lat?: number | string): LngLat | null => {
+  const lngValue = Number(lng);
+  const latValue = Number(lat);
+  if (!Number.isFinite(lngValue) || !Number.isFinite(latValue)) return null;
+  if (lngValue === 0 || latValue === 0) return null;
+  return { lng: lngValue, lat: latValue };
+};
+
+/** 半径越大，初始缩放级别越小，保证整个签到圈都在视野内 */
+const zoomForRange = (range: number): number => {
+  if (!Number.isFinite(range) || range <= 0) return 16;
+  if (range <= 200) return 18;
+  if (range <= 500) return 17;
+  if (range <= 1000) return 16;
+  if (range <= 2000) return 15;
+  return 14;
+};
+
 export const MapPicker: React.FC<MapPickerProps> = ({
   open,
   initialLng,
   initialLat,
   initialName,
   initialDescription,
+  signLng,
+  signLat,
+  signRange,
+  signAddress,
   onClose,
   onConfirm,
 }) => {
@@ -68,10 +97,14 @@ export const MapPicker: React.FC<MapPickerProps> = ({
 
   const mapRef = useRef<any>(null);
   const markerRef = useRef<any>(null);
+  const circleRef = useRef<any>(null);
+  const centerDotRef = useRef<any>(null);
   const geocoderRef = useRef<any>(null);
   const autoRef = useRef<any>(null);
   const placeSearchRef = useRef<any>(null);
   const searchTimerRef = useRef<number | null>(null);
+  const signPointRef = useRef<LngLat | null>(null);
+  const signAddressRef = useRef('');
 
   const [ready, setReady] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -79,6 +112,8 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [locating, setLocating] = useState(false);
+  const [signPoint, setSignPoint] = useState<LngLat | null>(null);
+  const [signRadius, setSignRadius] = useState(0);
 
   const [keyword, setKeyword] = useState('');
   const [tips, setTips] = useState<any[]>([]);
@@ -116,16 +151,29 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     if (!open) return;
 
     const fallback = LOCATION_PRESETS[0] || {};
-    const startLng = safeNumber(initialLng || fallback.lng, 109.720849);
-    const startLat = safeNumber(initialLat || fallback.lat, 28.290107);
+    // 老师设置的签到圆心：有值时优先作为初始视野，方便直接贴圆心选点。
+    const teacherPoint = toLngLat(signLng, signLat);
+    const teacherRange = Number(signRange) > 0 ? Number(signRange) : 0;
+    signPointRef.current = teacherPoint;
+    signAddressRef.current = (signAddress || '').trim();
+    setSignPoint(teacherPoint);
+    setSignRadius(teacherRange);
+
+    const hasInitial = !!initialLng && !!initialLat;
+    const startLng = safeNumber(initialLng || fallback.lng, teacherPoint?.lng ?? 109.720849);
+    const startLat = safeNumber(initialLat || fallback.lat, teacherPoint?.lat ?? 28.290107);
+    // 未手动选过点时，把视野对准签到圆心并按半径选缩放级别。
+    const centerLng = hasInitial ? startLng : teacherPoint?.lng ?? startLng;
+    const centerLat = hasInitial ? startLat : teacherPoint?.lat ?? startLat;
+    const startZoom = !hasInitial && teacherPoint ? zoomForRange(teacherRange) : 16;
 
     let cancelled = false;
     let completeTimer: number | null = null;
 
     setReady(false);
     setLoadError('');
-    setCurrent({ lng: startLng, lat: startLat });
-    setName(initialName || '');
+    setCurrent({ lng: centerLng, lat: centerLat });
+    setName(initialName || (teacherPoint && !hasInitial ? '老师签到点' : ''));
     setDescription(initialDescription || '');
     setLocating(false);
     setKeyword('');
@@ -151,12 +199,45 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         if (cancelled || !containerRef.current) return;
 
         const map = new AMap.Map(containerRef.current, {
-          zoom: 16,
-          center: [startLng, startLat],
+          zoom: startZoom,
+          center: [centerLng, centerLat],
           viewMode: '2D',
           resizeEnable: true,
         });
         mapRef.current = map;
+
+        // 老师设置的签到范围：半径圈 + 圆心点，直接告诉用户该往哪选。
+        if (teacherPoint) {
+          const circle = new AMap.Circle({
+            center: [teacherPoint.lng, teacherPoint.lat],
+            radius: teacherRange > 0 ? teacherRange : 500,
+            strokeColor: '#2563eb',
+            strokeWeight: 2,
+            strokeOpacity: 0.9,
+            strokeStyle: 'dashed',
+            fillColor: '#3b82f6',
+            fillOpacity: 0.1,
+            zIndex: 10,
+            bubble: true,
+          });
+          map.add(circle);
+          circleRef.current = circle;
+
+          if (AMap.CircleMarker) {
+            const dot = new AMap.CircleMarker({
+              center: [teacherPoint.lng, teacherPoint.lat],
+              radius: 5,
+              strokeColor: '#ffffff',
+              strokeWeight: 2,
+              fillColor: '#2563eb',
+              fillOpacity: 1,
+              zIndex: 20,
+              bubble: true,
+            });
+            map.add(dot);
+            centerDotRef.current = dot;
+          }
+        }
 
         // 瓦片加载完成后再次对齐中心点与缩放，避免首帧未生效时画面偏移
         map.on('complete', () => {
@@ -165,7 +246,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
             completeTimer = null;
           }
           if (cancelled) return;
-          map.setZoomAndCenter(16, [startLng, startLat]);
+          map.setZoomAndCenter(startZoom, [centerLng, centerLat]);
         });
 
         // 底图长时间加载不完成时给出明确提示：
@@ -177,7 +258,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         }, 10000);
 
         const marker = new AMap.Marker({
-          position: [startLng, startLat],
+          position: [centerLng, centerLat],
           draggable: true,
           cursor: 'move',
           anchor: 'bottom-center',
@@ -205,7 +286,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
 
         // 已有选中点时保留原有名称/地址，只补全缺失的部分
         if (!initialDescription || !initialName) {
-          geocoderRef.current.getAddress([startLng, startLat], (status: string, result: any) => {
+          geocoderRef.current.getAddress([centerLng, centerLat], (status: string, result: any) => {
             if (cancelled || status !== 'complete' || !result?.regeocode) return;
             if (!initialDescription) {
               setDescription(result.regeocode.formattedAddress || '');
@@ -244,6 +325,8 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         mapRef.current = null;
       }
       markerRef.current = null;
+      circleRef.current = null;
+      centerDotRef.current = null;
       geocoderRef.current = null;
       autoRef.current = null;
       placeSearchRef.current = null;
@@ -324,10 +407,50 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     );
   };
 
+  /**
+   * 在签到圆心附近做几米随机偏移：
+   * 既保证落在老师设置的半径内，又避免所有账号提交完全相同的坐标。
+   */
+  const jitterNear = (point: LngLat, maxMeters = 8): LngLat => {
+    const angle = Math.random() * Math.PI * 2;
+    const meters = 2 + Math.random() * maxMeters; // 2~10 米
+    const dLat = (meters * Math.cos(angle)) / 111320;
+    const cosLat = Math.cos((point.lat * Math.PI) / 180) || 1;
+    const dLng = (meters * Math.sin(angle)) / (111320 * cosLat);
+    return { lng: point.lng + dLng, lat: point.lat + dLat };
+  };
+
+  /** 一键落到老师设置的签到点（加轻微随机偏移） */
+  const handleUseSignPoint = () => {
+    const point = signPointRef.current;
+    if (!point) return;
+
+    const target = jitterNear(point);
+    setCurrent(target);
+    mapRef.current?.setZoomAndCenter(Math.max(zoomForRange(signRadius), 17), [target.lng, target.lat]);
+    markerRef.current?.setPosition([target.lng, target.lat]);
+    setName('老师签到点');
+    setDescription(signAddressRef.current || '老师设置的签到点');
+    toast.success('已定位到老师签到点附近');
+  };
+
+  // 当前选点与签到圆心的距离：用于提示是否落在老师设置的半径内。
+  const distanceToSign = signPoint && current ? distanceMeters(current, signPoint) : Number.NaN;
+  const withinSignRange =
+    !!signPoint && Number.isFinite(distanceToSign) && signRadius > 0 && distanceToSign <= signRadius;
+
   const handleConfirm = () => {
     if (!current) {
       toast.error('请先在地图上选择位置');
       return;
+    }
+
+    // 超出半径时给出明确提示，但仍允许提交（老师坐标本身也可能有偏差）。
+    if (signPoint && signRadius > 0 && Number.isFinite(distanceToSign) && distanceToSign > signRadius) {
+      toast.error(
+        `当前选点距签到点约 ${Math.round(distanceToSign)} 米，超出 ${signRadius} 米签到范围，签到可能失败`,
+        { id: 'sign-range-warn', duration: 4000 }
+      );
     }
 
     const lngStr = formatCoord(current.lng);
@@ -421,6 +544,19 @@ export const MapPicker: React.FC<MapPickerProps> = ({
             >
               {locating ? <Loader2 size={20} className="animate-spin" /> : <LocateFixed size={20} />}
             </button>
+
+            {/* 有老师设置的签到点时，提供一键贴近圆心的入口 */}
+            {signPoint && (
+              <button
+                type="button"
+                onClick={handleUseSignPoint}
+                disabled={!ready}
+                title={signAddressRef.current || '老师设置的签到点'}
+                className="absolute right-4 bottom-20 h-9 px-3 rounded-full bg-blue-600 text-white text-xs font-bold shadow-lg shadow-blue-600/30 active:scale-95 transition-transform disabled:opacity-60"
+              >
+                用签到点
+              </button>
+            )}
           </div>
 
           <div className="px-5 py-4 border-t border-slate-100 shrink-0 pb-[calc(16px+var(--sab))]">
@@ -438,6 +574,29 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                 </p>
               </div>
             </div>
+
+            {signPoint ? (
+              <div
+                className={`mb-3 flex items-center gap-1.5 text-[11px] font-bold ${
+                  withinSignRange ? 'text-emerald-600' : 'text-amber-600'
+                }`}
+              >
+                <Target size={13} className="shrink-0" />
+                <span className="truncate">
+                  {Number.isFinite(distanceToSign)
+                    ? `距签到点约 ${Math.round(distanceToSign)} 米`
+                    : '正在计算与签到点的距离'}
+                  {signRadius > 0 ? `（签到范围 ${signRadius} 米）` : ''}
+                  {withinSignRange ? ' · 在范围内' : ' · 建议靠近圆心'}
+                </span>
+              </div>
+            ) : (
+              <div className="mb-3 flex items-center gap-1.5 text-[11px] text-slate-400">
+                <Target size={13} className="shrink-0" />
+                <span className="truncate">未获取到老师的签到点，请尽量贴近老师所在位置选择</span>
+              </div>
+            )}
+
             <button
               type="button"
               onClick={handleConfirm}

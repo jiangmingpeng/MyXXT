@@ -64,6 +64,29 @@ export function wgs84ToGcj02(lng: number, lat: number): LngLat {
 }
 
 /**
+ * 计算两点间的球面距离（米），使用 Haversine 公式。
+ * 两个坐标必须属于同一坐标系（本项目统一用 GCJ-02），否则会叠加坐标系偏移。
+ */
+export function distanceMeters(from: LngLat, to: LngLat): number {
+  if (![from.lng, from.lat, to.lng, to.lat].every((v) => Number.isFinite(v))) {
+    return Number.NaN;
+  }
+
+  const R = 6371008.8; // 地球平均半径（米）
+  const rad = (deg: number) => (deg * PI) / 180;
+  const dLat = rad(to.lat - from.lat);
+  const dLng = rad(to.lng - from.lng);
+  const lat1 = rad(from.lat);
+  const lat2 = rad(to.lat);
+
+  const h =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/**
  * 坐标格式化为字符串：保留 7 位小数（约 1cm 精度），
  * 去掉浮点尾巴的同时不损失可用精度。
  */

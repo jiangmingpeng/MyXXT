@@ -1,6 +1,7 @@
 package xxt
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -74,6 +75,87 @@ func TestSignQRCodeReusesPrefetchedValidate(t *testing.T) {
 	}
 	if enc := rt.query[0].Get("enc"); enc != "ENC123" {
 		t.Fatalf("enc = %q, want ENC123", enc)
+	}
+}
+
+// 二维码签到必须带上学校 fid、课程 id、设备标识与反作弊参数，
+// 并额外发送 locationResult（带 mockData 字符串的第二个定位参数）。
+func TestSignQRCodeSendsFidAndAntiCheatParams(t *testing.T) {
+	jar, _ := cookiejar.New(nil)
+	rt := &recordingTransport{}
+	c := &Client{
+		mobileUA: "xbt-test",
+		http:     &http.Client{Transport: rt},
+		sessions: map[string]*Session{},
+	}
+	c.sessions["13800000000"] = &Session{
+		Mobile:      "13800000000",
+		Password:    "pw",
+		UID:         2,
+		Name:        "测试",
+		Fid:         12345,
+		DeviceCode:  "devcode0123456789",
+		Jar:         jar,
+		LastLoginAt: time.Now(),
+	}
+
+	fixed := FixedParams{ActiveID: 1, UID: 2, CourseID: 3, ClassID: 4}
+	got, err := c.Sign("13800000000", "pw", fixed, SignQRCode, map[string]interface{}{
+		"enc":         "ENC123",
+		"validate":    "VALIDATE456",
+		"latitude":    30.5,
+		"longitude":   120.5,
+		"description": "图书馆",
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if got != "success" {
+		t.Fatalf("result = %q, want success", got)
+	}
+	if len(rt.query) != 1 {
+		t.Fatalf("requests = %v, want exactly 1", rt.paths)
+	}
+
+	q := rt.query[0]
+	for key, want := range map[string]string{
+		"fid":           "12345",
+		"courseId":      "3",
+		"deviceCode":    "devcode0123456789",
+		"vpProbability": "-1",
+		"latitude":      "-1",
+		"longitude":     "-1",
+	} {
+		if v := q.Get(key); v != want {
+			t.Errorf("%s = %q, want %q", key, v, want)
+		}
+	}
+	// vpStrategy 需要显式携带空值（与 ChaoxingSignFaker 一致）。
+	if _, exists := q["vpStrategy"]; !exists {
+		t.Errorf("vpStrategy should be present (empty), query=%v", q)
+	}
+	// 二维码签到不应携带空 useragent。
+	if _, exists := q["useragent"]; exists {
+		t.Errorf("useragent should be absent, got %q", q.Get("useragent"))
+	}
+
+	var location map[string]interface{}
+	if err := json.Unmarshal([]byte(q.Get("location")), &location); err != nil {
+		t.Fatalf("unmarshal location: %v", err)
+	}
+	if location["result"] != float64(1) {
+		t.Errorf("location.result = %#v, want number 1", location["result"])
+	}
+	if _, exists := location["mockData"]; exists {
+		t.Errorf("location should not carry mockData, got %v", location["mockData"])
+	}
+
+	var locationResult map[string]interface{}
+	if err := json.Unmarshal([]byte(q.Get("locationResult")), &locationResult); err != nil {
+		t.Fatalf("unmarshal locationResult: %v", err)
+	}
+	if locationResult["mockData"] != `{"strategy":0,"probability":-1}` {
+		t.Errorf("locationResult.mockData = %#v, want anti-mock JSON string", locationResult["mockData"])
 	}
 }
 

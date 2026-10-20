@@ -41,6 +41,14 @@ export interface SignActivity {
   sign_type: number;
   if_refresh_ewm: boolean;
   if_photo: boolean;
+  /** 是否启用位置校验（学习通 ifopenAddress）。 */
+  if_open_address?: boolean;
+  /** 老师设置的签到圆心（GCJ-02）。 */
+  location_latitude?: number;
+  location_longitude?: number;
+  /** 老师设置的签到半径（米）。 */
+  location_range?: number;
+  location_address?: string;
   record_source_name: string;
   record_source: number;
   record_sign_time: number;
