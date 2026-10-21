@@ -55,6 +55,8 @@ interface MapPickerProps {
   /** 老师设置的签到半径（米） */
   signRange?: number;
   signAddress?: string;
+  /** 当前活动是不是刷新二维码（enc 只有几秒有效期，校准必须每次等新码） */
+  refreshQr?: boolean;
   /**
    * 圆心探测：真实提交一次坐标，拿回学习通返回的“距签到圆心距离（米）”。
    * 学习通不下发圆心经纬度，只有这个距离能精确反解圆心，所以由父页面
@@ -71,7 +73,32 @@ export interface SignCenterProbe {
   signed: boolean;
   /** 距老师真实圆心的距离（米）；为空表示这次没拿到距离 */
   distance: number | null;
+  /**
+   * 当前是不是刷新二维码（enc 只有几秒有效期）。
+   * 为 true 时父页面会在每次探测前等一张新码，这里就不能再叠加长随机等待。
+   */
+  refreshQr?: boolean;
+  /** 本次失败重试也没用（例如根本没扫到新码），不要再叠加一次探测 */
+  retryable?: boolean;
+  /**
+   * 手上没有可用新码，需要用户再拍 / 导入一张二维码。
+   * 与「失败」不同：已采集的探测距离有效，应由地图页保留进度、暂停本轮，等下一张码回来续传。
+   */
+  needQr?: boolean;
   message?: string;
+}
+
+/**
+ * 圆心校准会话：跨面板开关保留。
+ * HTTP 手机页面没有摄像头权限，只能用「拍照 / 相册」一张一张导入二维码；
+ * 刷新码每探测一次都要一张新码，所以必须把已采集的采样点保留下来，
+ * 拍下一张回来后接着上次进度继续，而不是从第一次探测重新开始。
+ */
+interface CalibrationSession {
+  /** 已经拿到距离的探测点（绝对坐标 + 距圆心米数） */
+  samples: DistanceSample[];
+  /** 本轮固定的三个探测点（顺序已打乱）。samples.length 就是下一个要探测的下标。 */
+  probes: { label: string; point: LngLat }[];
 }
 
 /** 兼容 AMap.LngLat 对象与 { lng, lat } 普通对象两种形态 */
@@ -217,6 +244,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   signLat,
   signRange,
   signAddress,
+  refreshQr = false,
   onProbeDistance,
   onClose,
   onConfirm,
@@ -237,6 +265,8 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   const showSignAreaRef = useRef<((pos: LngLat) => void) | null>(null);
   /** 校准取消标志：面板关闭时置 true，让正在跑的探测循环尽快退出 */
   const calibrateCancelledRef = useRef(false);
+  /** 面板是否打开：异步探测循环用它判断用户是不是已经关面板去拍下一张二维码了 */
+  const openRef = useRef(open);
   /** 已校准标志：防止迟到的地址反查把校准结果覆盖回偏差几百米的兜底坐标 */
   const calibratedRef = useRef(false);
   /** 用户手动移动过选点：迟到的地址反查不再抢夺选点 */
@@ -262,6 +292,21 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   const [calibrateResidual, setCalibrateResidual] = useState<number | null>(null);
   /** 本次打开面板已经校准了几轮（每轮 3 次真实提交），用于限制总请求量 */
   const [calibrateRuns, setCalibrateRuns] = useState(0);
+  /**
+   * 圆心校准会话：放在组件级 ref 里，不随面板开关重置。
+   * 拍照模式下每次拍新码都要关面板，回来后续传靠它保留已采集的采样点。
+   */
+  const calibrationSessionRef = useRef<CalibrationSession | null>(null);
+  /** 会话的界面镜像：用于按钮显示「继续校准（n/3）」并触发重渲染 */
+  const [pendingCalibration, setPendingCalibration] = useState<CalibrationSession | null>(null);
+
+  /** 更新/清空校准会话：ref 供异步循环读写，state 供界面显示进度 */
+  const setCalibrationSession = (session: CalibrationSession | null) => {
+    calibrationSessionRef.current = session;
+    setPendingCalibration(
+      session ? { samples: [...session.samples], probes: session.probes } : null
+    );
+  };
 
   const [keyword, setKeyword] = useState('');
   const [tips, setTips] = useState<any[]>([]);
@@ -298,6 +343,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
 
   // 打开时初始化地图；关闭时销毁，避免复用已卸载的容器
   useEffect(() => {
+    openRef.current = open;
     if (!open) return;
 
     const fallback = LOCATION_PRESETS[0] || {};
@@ -318,6 +364,16 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     calibrateCancelledRef.current = false;
     calibratedRef.current = false;
     userMovedRef.current = false;
+
+    // 拍照 / 相册模式：上一轮校准只做了部分探测就关面板去拍新码，
+    // 这里提示用户点「继续校准」接着上次，而不是从第一次重新开始。
+    const pending = calibrationSessionRef.current;
+    if (pending && pending.samples.length > 0) {
+      toast(
+        `检测到未完成的圆心校准（已完成 ${pending.samples.length}/${pending.probes.length} 次探测），点下方「继续校准」接着上次`,
+        { icon: '📷', id: 'calibrate-resume', duration: 6000 }
+      );
+    }
 
     const hasInitial = !!initialLng && !!initialLat;
     const startLng = safeNumber(initialLng || fallback.lng, teacherPoint?.lng ?? 109.720849);
@@ -691,30 +747,33 @@ export const MapPicker: React.FC<MapPickerProps> = ({
    * 用它当标尺，三个不共线的点各探测一次就能反解出真实圆心：
    *   1. 以当前选中点为基准，另取两个偏移点（约 320~450 米，整体随机旋转，保证不共线）；
    *   2. 依次探测，顺序打乱、每次间隔随机 4~9 秒，避免等间隔高频请求被风控；
+   *      刷新码例外：enc 只有几秒有效期，间隔由「等一张新码」自己决定，不再叠加长等待；
    *   3. 最小二乘解出圆心，把半径圈和选中点一起挪过去，并显示残差。
+   *
+   * 可续传：手机 HTTP 页面只能拍照 / 相册导入二维码，刷新码每探测一次都要一张新码。
+   * 探测返回 needQr 时本轮暂停，已采集的采样点和固定的三个探测点会保留在
+   * calibrationSessionRef 里；用户拍下一张回来点「继续校准」，从上次断点接着探测。
    *
    * 探测点都在范围外，正常不会签到成功；万一某次恰好落在范围内，直接算签到成功。
    */
   const handleCalibrate = async () => {
     if (!onProbeDistance || calibrating) return;
-    const seed = current ?? signPointRef.current;
-    if (!seed) {
-      toast.error('请先在地图上选一个大致的点再校准');
-      return;
-    }
-    // 每轮校准 = 3 次真实提交。为避免对学习通造成高频请求，单次选点最多 2 轮。
-    if (calibrateRuns >= CALIBRATE_MAX_RUNS) {
-      toast.error('本次选点已校准过，若仍不准请关闭面板重新打开后再试', { duration: 5000 });
-      return;
-    }
-    setCalibrateRuns((n) => n + 1);
 
-    calibrateCancelledRef.current = false;
-    setCalibrating(true);
-    setCalibrateStatus('正在准备探测…');
-    setCalibrateResidual(null);
+    // 有未完成的会话就接着上次跑，不需要重新选点，也不占用新的“校准轮次”。
+    let session = calibrationSessionRef.current;
+    if (!session) {
+      const seed = current ?? signPointRef.current;
+      if (!seed) {
+        toast.error('请先在地图上选一个大致的点再校准');
+        return;
+      }
+      // 每轮校准 = 3 次真实提交。为避免对学习通造成高频请求，单次选点最多 2 轮。
+      if (calibrateRuns >= CALIBRATE_MAX_RUNS) {
+        toast.error('本次选点已校准过，若仍不准请关闭面板重新打开后再试', { duration: 5000 });
+        return;
+      }
+      setCalibrateRuns((n) => n + 1);
 
-    try {
       // 两个偏移方向正交（保证三点不共线），整体随机旋转，避免每次探测点完全一致。
       const spin = Math.random() * Math.PI * 2;
       const step = 320 + Math.random() * 130;
@@ -736,16 +795,60 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         [probes[i], probes[j]] = [probes[j], probes[i]];
       }
 
-      const samples: DistanceSample[] = [];
-      for (let i = 0; i < probes.length; i += 1) {
-        if (i > 0 && !(await waitRandom(`第 ${i + 1} 次探测前等待`))) return;
+      session = { samples: [], probes };
+      setCalibrationSession(session);
+    }
+
+    const probes = session.probes;
+    // 会话本身持有采样数组：每拿到一个距离就往里 push，关面板也不会丢
+    const samples = session.samples;
+    // 续传时跳过已采集的点（samples.length 就是下一个待探测下标）
+    const startIndex = samples.length;
+
+    calibrateCancelledRef.current = false;
+    setCalibrating(true);
+    setCalibrateStatus(
+      startIndex > 0
+        ? `继续校准：已完成 ${startIndex}/${probes.length} 次探测，接着探测第 ${startIndex + 1} 个点`
+        : '正在准备探测…'
+    );
+    setCalibrateResidual(null);
+
+    try {
+      // 刷新码：父页面每次探测前都会等一张新码，那本身就是天然间隔；
+      // 这里再等 4~9 秒只会让 enc 白等过期，所以长等待只给静态码。
+      let isRefreshing = !!refreshQr;
+      for (let i = startIndex; i < probes.length; i += 1) {
+        // 续传回来的第一个点不等待（用户刚拍完新码回来）；同一轮内相邻探测才需要间隔。
+        if (i > startIndex) {
+          if (isRefreshing) {
+            // 刷新码：只做极短停顿，真正的间隔由父页面「等一张新码」决定
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 400));
+            if (calibrateCancelledRef.current) return;
+          } else if (!(await waitRandom(`第 ${i + 1} 次探测前等待`))) {
+            return;
+          }
+        }
         if (calibrateCancelledRef.current) return;
 
-        setCalibrateStatus(`探测 ${i + 1}/${probes.length}：${probes[i].label}`);
+        setCalibrateStatus(
+          isRefreshing && i > startIndex
+            ? `探测 ${i + 1}/${probes.length}：${probes[i].label}（等待扫到新二维码）`
+            : `探测 ${i + 1}/${probes.length}：${probes[i].label}`
+        );
         // 每次探测都是一次真实提交；没拿到距离就随机间隔后重试该点，避免偶发无距离直接废掉整轮校准。
         let res: SignCenterProbe | null = null;
-        for (let attempt = 1; attempt <= PROBE_MAX_ATTEMPTS; attempt += 1) {
-          if (attempt > 1 && !(await waitRandom(`第 ${i + 1} 次探测重试前等待`, 3000, 7000))) return;
+        const maxAttempts = PROBE_MAX_ATTEMPTS;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          if (attempt > 1) {
+            if (isRefreshing) {
+              // 刷新码：重试前只做极短停顿，新 enc 由父页面在探测里等
+              await new Promise<void>((resolve) => window.setTimeout(resolve, 400));
+            } else if (!(await waitRandom(`第 ${i + 1} 次探测重试前等待`, 3000, 7000))) {
+              return;
+            }
+            if (calibrateCancelledRef.current) return;
+          }
           let once: SignCenterProbe;
           try {
             once = await onProbeDistance(probes[i].point);
@@ -756,11 +859,27 @@ export const MapPicker: React.FC<MapPickerProps> = ({
           }
           if (calibrateCancelledRef.current) return;
           res = once;
+          if (typeof once.refreshQr === 'boolean') isRefreshing = once.refreshQr;
+          if (once.needQr) {
+            // 手上没有可用新码（拍照 / 相册模式）：暂停本轮，保留已采集的采样点，
+            // 等用户拍下一张后回来点「继续校准」，从这一点接着探测。
+            setCalibrationSession(session);
+            setCalibrateStatus(
+              `已保存 ${samples.length}/${probes.length} 次探测，请拍摄/导入下一张二维码后回来点「继续校准」`
+            );
+            toast(
+              `已保存 ${samples.length}/${probes.length} 次探测，请拍下一张二维码后回来继续校准`,
+              { icon: '📷', duration: 6000, id: 'calibrate-need-qr' }
+            );
+            return;
+          }
           if (once.signed) break;
           if (typeof once.distance === 'number' && Number.isFinite(once.distance) && once.distance > 0) {
             break;
           }
-          if (attempt < PROBE_MAX_ATTEMPTS) {
+          // 明确不可重试（没扫到新码 / 面板已关）就不再叠加第二次探测
+          if (once.retryable === false) break;
+          if (attempt < maxAttempts) {
             setCalibrateStatus(`探测 ${i + 1}/${probes.length} 未返回距离，稍后重试`);
           }
         }
@@ -774,21 +893,31 @@ export const MapPicker: React.FC<MapPickerProps> = ({
           markerRef.current?.setPosition([target.lng, target.lat]);
           setCalibrateStatus('探测时已直接签到成功');
           toast.success('探测时已直接签到成功', { duration: 5000 });
+          // 已经签上了，这次校准到此结束
+          setCalibrationSession(null);
           return;
         }
         if (typeof res.distance !== 'number' || !Number.isFinite(res.distance) || res.distance <= 0) {
+          // 用户已经关面板去拍照了：不要再弹错误打扰扫码
+          if (!openRef.current) return;
           const reason = res.message || '学习通没有返回距离，无法校准圆心';
-          setCalibrateStatus(reason);
-          toast.error(reason, { duration: 5000 });
+          setCalibrateStatus(`${reason}（已采集 ${samples.length}/${probes.length}，可点「继续校准」重试）`);
+          toast.error(reason, { duration: 6000 });
+          // 保留已采集的采样点：偶发无距离时用户可以直接再点「继续校准」重试这一探测点
+          setCalibrationSession(session);
           return;
         }
         samples.push({ lng: probes[i].point.lng, lat: probes[i].point.lat, distance: res.distance });
+        // 每拿到一个距离就同步会话：即使中途关面板，已采集的进度也不会丢
+        setCalibrationSession(session);
       }
 
       const solved = solveSignCenter(samples);
       if (!solved) {
         setCalibrateStatus('三个探测点几乎共线，无法解算圆心');
         toast.error('三个探测点几乎共线，无法解算圆心，请换个位置再试');
+        // 几何形状本身有问题，下一次重新生成探测点
+        setCalibrationSession(null);
         return;
       }
 
@@ -825,6 +954,8 @@ export const MapPicker: React.FC<MapPickerProps> = ({
       setDescription(signAddressRef.current || '自动校准的签到圆心');
 
       setCalibrateStatus(`圆心已校准（残差约 ${Math.round(maxResidual)} 米）`);
+      // 本轮校准完成：清空会话，下次点「重新校准圆心」会生成全新探测点
+      setCalibrationSession(null);
       if (maxResidual > 40) {
         toast('圆心已校准，但残差偏大，建议再校准一次复核', { icon: '⚠️', duration: 6000 });
       } else {
@@ -845,6 +976,9 @@ export const MapPicker: React.FC<MapPickerProps> = ({
       toast.error('请先在地图上选择位置');
       return;
     }
+
+    // 用户确认选点：这次校准（含未完成的会话）到此结束
+    setCalibrationSession(null);
 
     // 超出半径时给出明确提示，但仍允许提交（老师坐标本身也可能有偏差）。
     if (signPoint && signRadius > 0 && Number.isFinite(distanceToSign) && distanceToSign > signRadius) {
@@ -1033,12 +1167,29 @@ export const MapPicker: React.FC<MapPickerProps> = ({
               </div>
             )}
 
+            {/* 刷新码：enc 只有几秒有效期，校准要连续探测，必须摄像头一直能扫到 */}
+            {refreshQr && onProbeDistance && signSource !== 'api' && (
+              <div className="mb-2 flex items-start gap-1.5 rounded-xl bg-slate-50 px-3 py-2 text-[11px] font-bold text-slate-500">
+                <Info size={13} className="mt-0.5 shrink-0" />
+                <span>
+                  这是刷新二维码：校准期间请让摄像头一直对准二维码，每次探测会自动等一张新码（约 5~10 秒）。
+                  若是拍照 / 相册导入，每探测一次都要再拍一张新码，已采集的进度会自动保留，拍完点「继续校准」即可。
+                </span>
+              </div>
+            )}
+
             {/* 圆心校准：学习通不下发圆心经纬度，用 errorLocation2_<米> 的距离反馈反解真实圆心 */}
             {onProbeDistance && signSource !== 'api' && (
               <button
                 type="button"
                 onClick={handleCalibrate}
-                disabled={!ready || calibrating || locating || !current || calibrateRuns >= CALIBRATE_MAX_RUNS}
+                disabled={
+                  !ready ||
+                  calibrating ||
+                  locating ||
+                  !current ||
+                  (!pendingCalibration && calibrateRuns >= CALIBRATE_MAX_RUNS)
+                }
                 title="用三次真实探测反解老师设置的签到圆心（探测都在范围外，不会误签到）"
                 className="w-full mb-2 py-3 rounded-xl border-2 border-blue-100 bg-blue-50/60 text-blue-700 font-bold text-sm flex items-center justify-center gap-2 active:scale-[0.98] transition-transform disabled:opacity-60 disabled:active:scale-100"
               >
@@ -1046,13 +1197,40 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                 <span className="truncate">
                   {calibrating
                     ? calibrateStatus || '正在校准圆心…'
-                    : calibrateRuns >= CALIBRATE_MAX_RUNS
-                      ? '本次选点已校准，需重开面板才能再校准'
-                      : signSource === 'calibrated'
-                        ? '重新校准圆心'
-                        : '自动校准圆心（3 次探测）'}
+                    : pendingCalibration
+                      ? pendingCalibration.samples.length > 0
+                        ? `继续校准（已完成 ${pendingCalibration.samples.length}/${pendingCalibration.probes.length} 次探测）`
+                        : '继续校准（等待新二维码）'
+                      : calibrateRuns >= CALIBRATE_MAX_RUNS
+                        ? '本次选点已校准，需重开面板才能再校准'
+                        : signSource === 'calibrated'
+                          ? '重新校准圆心'
+                          : '自动校准圆心（3 次探测）'}
                 </span>
               </button>
+            )}
+            {pendingCalibration && !calibrating && (
+              <>
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="w-full mb-2 py-2.5 rounded-xl border-2 border-amber-100 bg-amber-50 text-amber-700 font-bold text-[11px] active:scale-[0.98] transition-transform"
+                >
+                  关闭面板去拍下一张二维码（校准进度已保留）
+                </button>
+                {pendingCalibration.samples.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCalibrationSession(null);
+                      setCalibrateStatus('');
+                    }}
+                    className="w-full mb-2 py-2 rounded-xl text-[11px] font-bold text-slate-400 active:scale-[0.98] transition-transform"
+                  >
+                    重新开始校准（丢弃已采集的 {pendingCalibration.samples.length} 次探测）
+                  </button>
+                )}
+              </>
             )}
             {!calibrating && calibrateStatus && (
               <p className="mb-2 text-[11px] font-medium text-slate-400 text-center">{calibrateStatus}</p>

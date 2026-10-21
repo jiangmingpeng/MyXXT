@@ -219,6 +219,14 @@ const FullScanner = () => {
     signRangeMeters
   );
   const latestQrDataRef = useRef<QrData | null>(null);
+  /** 上一次圆心探测用掉的二维码 enc（刷新码的 enc 时效很短，每次探测都必须换一张新码） */
+  const probeLastEncRef = useRef<string>('');
+  /**
+   * 当前是否真的有实时码流（原生相机，或 H5 摄像头可用且没报错）。
+   * HTTP 手机页面拿不到摄像头权限时这里恒为 false，只能用「拍照 / 相册」一张一张导入，
+   * 刷新码校准就不可能等到新码——探测要立刻暂停，让地图页保留进度等用户拍下一张。
+   */
+  const hasLiveCameraRef = useRef(false);
   const qrExpiredRef = useRef(false);
   const handlePasteRef = useRef<(event: ClipboardEvent) => void>(() => {});
   const isExecutingRef = useRef(false);
@@ -274,6 +282,12 @@ const FullScanner = () => {
   useEffect(() => {
     selectedDeviceIdRef.current = selectedDeviceId;
   }, [selectedDeviceId]);
+
+  useEffect(() => {
+    // 有没有实时码流：原生相机，或 H5 摄像头可用且没报错。
+    // HTTP 手机页面拿不到摄像头权限时这里恒为 false，刷新码校准只能靠每次拍照导入新码。
+    hasLiveCameraRef.current = isNativeBridgeMode || (cameras.length > 0 && !cameraError);
+  }, [isNativeBridgeMode, cameras, cameraError]);
 
   useEffect(() => {
     setNativeLensFacing(selectedDeviceId);
@@ -840,62 +854,164 @@ const FullScanner = () => {
   };
 
   /**
+   * 等摄像头扫到一张「还没用过」的二维码（刷新码校准专用）。
+   * 刷新码每张新码都会换 enc，且 enc 只有约 5~10 秒有效期；三边定位要连续提交
+   * 三次，只能每次都用一张刚扫到的新码。
+   *
+   * 返回 null 表示「手上没有可用新码」，由上层决定暂停续传还是放弃：
+   *   - 面板已关闭；
+   *   - 没有实时码流（HTTP 手机只能拍照 / 相册，每次拍完才有一张新码）；
+   *   - 有实时码流但超时内没扫到新码。
+   * 拍照模式下重新打开面板时，latestQrDataRef 已经是刚导入的那张新码，会直接命中。
+   */
+  const waitForFreshEnc = async (excludeEnc: string, timeoutMs = 15000): Promise<QrData | null> => {
+    if (!isMapPickerOpenRef.current) return null;
+
+    // 先看手上这张是不是「还没用过的新码」：拍照 / 相册导入后重新打开面板时，
+    // 最新二维码已经换了 enc，直接用它，不必再等实时码流。
+    const seen = latestQrDataRef.current || pendingQrRef.current;
+    if (seen?.enc && seen.enc !== excludeEnc) return seen;
+
+    // 没有实时码流（HTTP 手机只能用拍照 / 相册）：等不到新码，
+    // 交给上层暂停本轮校准，用户拍下一张后回来续传。
+    if (!hasLiveCameraRef.current) return null;
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!isMapPickerOpenRef.current) return null;
+      const qr = latestQrDataRef.current || pendingQrRef.current;
+      if (qr?.enc && qr.enc !== excludeEnc) return qr;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+    }
+    return null;
+  };
+
+  /**
    * 圆心探测：真实提交一次坐标，只为拿到学习通返回的“距签到圆心多少米”
    * （errorLocation2_<米>，后端已解析成 location_distance_meters）。
    *
    * 学习通不下发圆心经纬度，这个距离是唯一精确标尺；地图选点里的
    * “自动校准圆心”用它做三边定位反解真实圆心。探测点一般都在范围外，
    * 万一恰好落在范围内就等于直接签到成功，如实返回 signed。
+   *
+   * 刷新码（if_refresh_ewm，或二维码带 c 参数）特殊处理：enc 只能撑几秒，
+   * 每次探测前都等一张新码，遇到 2001 二维码失效就换新码重试，否则第三次
+   * 探测必然拿着过期 enc 提交、整轮校准作废。
    */
   const probeSignCenterDistance = async (point: { lng: number; lat: number }) => {
-    const qr = latestQrDataRef.current || pendingQrRef.current;
     const targetUid = orderedTargetUids[0];
-    if (!activity || !qr?.enc || !targetUid) {
+    if (!activity || !targetUid) {
       return { signed: false, distance: null, message: '还没有拿到二维码或账号信息，无法校准' };
     }
+    const isRefreshQr = !!activity.if_refresh_ewm || !!latestQrDataRef.current?.c;
+    const maxAttempts = isRefreshQr ? 2 : 1;
+    let lastMessage = '';
 
-    const special_params: Record<string, any> = {
-      enc: qr.enc,
-      latitude: formatCoord(point.lat),
-      longitude: formatCoord(point.lng),
-      // 必须带上地址：学习通对空地址偶尔只回不带距离的 errorLocationX，
-      // 那样就解不出圆心；正常能回 errorLocation2_<米> 的提交都带完整地址。
-      description: activity.location_address || '',
+    /** 用当前手中的二维码真实提交一次，只取回「是否已签到 / 距圆心多少米」 */
+    const submitWith = async (qr: QrData) => {
+      const params: Record<string, any> = {
+        enc: qr.enc,
+        latitude: formatCoord(point.lat),
+        longitude: formatCoord(point.lng),
+        // 必须带上地址：学习通对空地址偶尔只回不带距离的 errorLocationX，
+        // 那样就解不出圆心；正常能回 errorLocation2_<米> 的提交都带完整地址。
+        description: activity.location_address || '',
+      };
+      if (qr.c) params.c = qr.c;
+      if (qr.dbStrategy) params.db_strategy = qr.dbStrategy;
+      if (qr.strategyPara) params.strategy_para = qr.strategyPara;
+
+      const resp = await client.post<ApiResponse<SignExecuteResult>>('/sign/execute', {
+        activity_id: activity.active_id,
+        target_uid: targetUid,
+        sign_type: 2,
+        course_id: activity.course_id,
+        class_id: activity.class_id,
+        if_refresh_ewm: activity.if_refresh_ewm,
+        special_params: params,
+      });
+      return resp.data.data;
     };
-    if (qr.c) special_params.c = qr.c;
-    if (qr.dbStrategy) special_params.db_strategy = qr.dbStrategy;
-    if (qr.strategyPara) special_params.strategy_para = qr.strategyPara;
 
-    const resp = await client.post<ApiResponse<SignExecuteResult>>('/sign/execute', {
-      activity_id: activity.active_id,
-      target_uid: targetUid,
-      sign_type: 2,
-      course_id: activity.course_id,
-      class_id: activity.class_id,
-      if_refresh_ewm: activity.if_refresh_ewm,
-      special_params,
-    });
-    const res = resp.data.data;
-    const signed = !!(res.success || res.already_signed);
-    const distance =
-      typeof res.location_distance_meters === 'number'
-        ? res.location_distance_meters
-        : parseDistanceFromText(res.message);
-    console.info(
-      '[sign] 圆心探测:',
-      `${point.lng},${point.lat}`,
-      `signed=${signed}`,
-      `distance=${distance}`,
-      res.message
-    );
-    if (signed) {
-      // 探测顺带签上了：同步面板状态，避免用户再提交一次。
-      setSignStatuses((prev) => ({
-        ...prev,
-        [targetUid]: { status: 'success', message: res.message || '签到成功' },
-      }));
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let qr: QrData | null = null;
+      if (isRefreshQr) {
+        // 排除上一次用过（或已过期）的 enc，等一张新码。
+        qr = await waitForFreshEnc(probeLastEncRef.current);
+        if (!qr?.enc) {
+          // 面板已关闭：不要再补一次真实提交
+          if (!isMapPickerOpenRef.current) {
+            return { signed: false, distance: null, refreshQr: true, retryable: false, message: '已取消校准' };
+          }
+          // 手上没有可用新码（拍照 / 相册模式，或摄像头没对着二维码）：
+          // 暂停本轮校准，让地图页保留已采集的采样点，用户拍下一张后回来续传。
+          return {
+            signed: false,
+            distance: null,
+            refreshQr: true,
+            retryable: false,
+            needQr: true,
+            message: '需要一张新的二维码，请拍摄/导入下一张后继续校准',
+          };
+        }
+      } else {
+        qr = latestQrDataRef.current || pendingQrRef.current;
+      }
+      if (!qr?.enc) {
+        return { signed: false, distance: null, refreshQr: isRefreshQr, message: '还没有拿到二维码或账号信息，无法校准' };
+      }
+      probeLastEncRef.current = qr.enc;
+
+      const res = await submitWith(qr);
+      const signed = !!(res.success || res.already_signed);
+      const distance =
+        typeof res.location_distance_meters === 'number'
+          ? res.location_distance_meters
+          : parseDistanceFromText(res.message);
+      console.info(
+        '[sign] 圆心探测:',
+        `${point.lng},${point.lat}`,
+        `signed=${signed}`,
+        `distance=${distance}`,
+        res.message
+      );
+
+      // 刷新码：这张 enc 已过期，换一张新码再来（过期提交不会被记成签到）
+      if (isRefreshQr && res.code === SIGN_ERR_QR_EXPIRED) {
+        lastMessage = res.message || '二维码已过期';
+        if (attempt < maxAttempts) {
+          console.info('[sign] 圆心探测遇到二维码过期，换新码重试:', attempt);
+          continue;
+        }
+        // 已换过一次新码仍过期（或没有实时码流拿不到新码）：暂停，等下一张照片再续传。
+        return {
+          signed: false,
+          distance: null,
+          refreshQr: true,
+          retryable: false,
+          needQr: true,
+          message: '二维码已过期，请拍摄/导入一张新的二维码后继续校准',
+        };
+      }
+
+      if (signed) {
+        // 探测顺带签上了：同步面板状态，避免用户再提交一次。
+        setSignStatuses((prev) => ({
+          ...prev,
+          [targetUid]: { status: 'success', message: res.message || '签到成功' },
+        }));
+      }
+      return { signed, distance, refreshQr: isRefreshQr, message: res.message };
     }
-    return { signed, distance, message: res.message };
+
+    return {
+      signed: false,
+      distance: null,
+      refreshQr: true,
+      retryable: false,
+      needQr: true,
+      message: lastMessage || '二维码已过期，请拍摄/导入一张新的二维码后继续校准',
+    };
   };
 
   // 统一入口：已明确选择过位置（含“不使用位置”）直接提交；
@@ -929,6 +1045,8 @@ const FullScanner = () => {
     // 用户取消过、或正在手动选择位置时，不再自动弹出地图
     if (skipAutoLocationPickerRef.current || isMapPickerOpenRef.current || isLocationSheetOpenRef.current) return;
 
+    // 不清 probeLastEncRef：保留上一次探测用过的 enc，
+    // 这样「没有新码就重新打开面板」会被识别为 needQr，避免拿同一张码重复提交。
     isMapPickerOpenRef.current = true;
     setIsMapPickerOpen(true);
   };
@@ -1545,7 +1663,11 @@ const FullScanner = () => {
               <div className="flex items-center justify-between mb-6 shrink-0"><h3 className="text-xl font-bold text-slate-900">选择签到位置</h3><button onClick={() => setIsLocationPickerOpen(false)} className="w-8 h-8 flex items-center justify-center bg-slate-100 text-slate-400 rounded-full">✕</button></div>
               <button
                 type="button"
-                onClick={() => { skipAutoLocationPickerRef.current = false; setIsMapPickerOpen(true); }}
+                onClick={() => {
+                  skipAutoLocationPickerRef.current = false;
+                  // 不清 probeLastEncRef：续传校准要用它判断手上这张码是不是「新码」
+                  setIsMapPickerOpen(true);
+                }}
                 className="w-full mb-4 py-3 rounded-2xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-600/20 active:scale-[0.98] transition-transform shrink-0"
               >
                 <MapPin size={18} />
@@ -1588,6 +1710,7 @@ const FullScanner = () => {
         signLat={activity?.location_latitude}
         signRange={activity?.location_range}
         signAddress={activity?.location_address}
+        refreshQr={!!activity?.if_refresh_ewm || !!latestQrData?.c}
         onProbeDistance={probeSignCenterDistance}
         onClose={() => {
           setIsMapPickerOpen(false);
