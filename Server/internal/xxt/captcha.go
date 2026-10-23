@@ -2,6 +2,7 @@ package xxt
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,25 +13,67 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"xbt2/server/internal/antiban"
 )
+
+// captchaSolveBudget 是一次验证码识别允许消耗的时间上限。
+//
+// 刷新二维码的 enc 有效期只有 5~10s，签到链路后面还要留一次 stuSignajax 的往返。
+// 超过这个预算就快速失败，让前端换一张新码重试，而不是把有效期全部烧在
+// 试错上（旧实现最多 8 个候选 × 每次一个代理往返，慢节点上能到 16s）。
+const captchaSolveBudget = 12 * time.Second
+
+// isTransportError 判断错误是否来自网络层（代理超时、连接被重置等），
+// 而不是"滑块位置不对"这类业务失败。两者的重试策略完全不同。
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return true
+	}
+	var nerr net.Error
+	return errors.As(err, &nerr)
+}
+
+// captchaImageRequest 说明为什么验证码图片走"读"档：
+//
+// 元信息 / 背景图 / 滑块图都是静态下载，不改变账号状态。若按写请求
+// （300~1200ms）排队，会把账号的下一次写请求（stuSignajax）额外推后一个间隔。
+// 读档与写档在 pacer 里是两条独立时间线（AcquireRead 用 "<mobile>|r"），
+// 既仍然受全局并发上限约束，也不会占用签到的写窗口。
+func (c *Client) captchaImageRequest(cli *http.Client, mobile string, req *http.Request) (*http.Response, error) {
+	return c.doRead(context.Background(), mobile, cli, req)
+}
 
 // FetchCaptchaValidate 预抓一次滑动验证码，返回可直接用于 stuSignajax 的 validate。
 // 验证码使用独立的临时 cookie jar，与目标账号会话互不影响，
 // 因此调用方可以把它和预签到等步骤并行执行，缩短刷新二维码的签到耗时。
-func (c *Client) FetchCaptchaValidate(fixed FixedParams) (string, error) {
-	return c.fetchCaptchaValidate(fixed)
+//
+// mobile 用于取该账号的代理与设备指纹，并参与节流：验证码服务本身也有频率风控，
+// 暴力枚举滑块位置是最容易触发封禁的行为之一。
+func (c *Client) FetchCaptchaValidate(mobile string, fixed FixedParams) (string, error) {
+	return c.fetchCaptchaValidate(mobile, fixed)
 }
 
-func (c *Client) fetchCaptchaValidate(fixed FixedParams) (string, error) {
+func (c *Client) fetchCaptchaValidate(mobile string, fixed FixedParams) (string, error) {
+	started := time.Now()
+	profile := c.profileFor(mobile)
+	ua := c.uaForProfile(profile)
+
 	jar, _ := cookiejar.New(nil)
-	captchaHTTP := *c.http
+	captchaHTTP := *c.httpForProfile(profile)
 	captchaHTTP.Jar = jar
 
 	captchaKey, token := generateCaptchaKeyAndToken(captchaID, captchaType)
@@ -50,8 +93,8 @@ func (c *Client) fetchCaptchaValidate(fixed FixedParams) (string, error) {
 	q.Set("referer", referer)
 
 	req, _ := http.NewRequest(http.MethodGet, imageURL+"?"+q.Encode(), nil)
-	setCaptchaHeaders(req, referer)
-	resp, err := captchaHTTP.Do(req)
+	setCaptchaHeaders(req, referer, ua)
+	resp, err := c.captchaImageRequest(&captchaHTTP, mobile, req)
 	if err != nil {
 		return "", err
 	}
@@ -75,26 +118,78 @@ func (c *Client) fetchCaptchaValidate(fixed FixedParams) (string, error) {
 		return "", errors.New("captcha payload incomplete")
 	}
 
-	bgBytes, err := c.downloadBytes(&captchaHTTP, payload.ImageVerificationVo.ShadeImage, referer)
-	if err != nil {
-		return "", err
+	// 背景图与滑块图互不依赖，并行下载可以省掉一次代理往返（慢节点上约 1~2s）。
+	var (
+		bgBytes, targetBytes []byte
+		bgErr, targetErr     error
+		wg                   sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		bgBytes, bgErr = c.downloadBytes(&captchaHTTP, mobile, ua, payload.ImageVerificationVo.ShadeImage, referer)
+	}()
+	go func() {
+		defer wg.Done()
+		targetBytes, targetErr = c.downloadBytes(&captchaHTTP, mobile, ua, payload.ImageVerificationVo.CutoutImage, referer)
+	}()
+	wg.Wait()
+	if bgErr != nil {
+		return "", bgErr
 	}
-	targetBytes, err := c.downloadBytes(&captchaHTTP, payload.ImageVerificationVo.CutoutImage, referer)
-	if err != nil {
-		return "", err
+	if targetErr != nil {
+		return "", targetErr
 	}
 	candidates, err := detectSlideXCandidates(targetBytes, bgBytes)
 	if err != nil {
 		return "", err
 	}
 
+	// 关键风控点：以前最多会对一张验证码连续尝试 40 个坐标，
+	// 在学习通看来这就是一个明显的机器人在穷举。这里改成
+	// "少量最优候选 + 每次失败后随机停顿"，代价是偶发需要用户重试。
+	maxAttempts := 8
+	if c.guard != nil {
+		maxAttempts = c.guard.CaptchaMaxAttempts()
+	}
+	// 整段验证码识别的总预算。刷新二维码的 enc 只有几秒有效期，
+	// 无脑重试到第 8 个候选会把有效期全部吃光，反而不如快速失败让前端换新码。
+	budget := started.Add(captchaSolveBudget)
+	// 连续的网络层失败（代理超时 / 连接被重置）与"滑块位置不对"不同：
+	// 代理连续两次都不通时，继续把 8 个候选全试一遍只是在烧二维码有效期。
+	transportFails := 0
+
 	var lastErr error
+	attempts := 0
 	for _, x := range candidates {
-		validate, err := c.verifyCaptchaAtX(&captchaHTTP, referer, payload.Token, x)
+		if attempts >= maxAttempts {
+			break
+		}
+		if time.Now().After(budget) {
+			lastErr = errors.New("captcha solve budget exceeded")
+			break
+		}
+		attempts++
+		validate, err := c.verifyCaptchaAtX(&captchaHTTP, mobile, ua, referer, payload.Token, x)
 		if err == nil && strings.TrimSpace(validate) != "" {
 			return validate, nil
 		}
 		lastErr = err
+		if isTransportError(err) {
+			transportFails++
+			if transportFails >= 2 {
+				lastErr = fmt.Errorf("captcha transport failed %d times: %w", transportFails, err)
+				break
+			}
+		} else {
+			transportFails = 0
+		}
+		// 失败后随机停顿，避免"同一毫秒连续提交 8 次"的机器特征。
+		_ = sleepCtx(context.Background(), antiban.RandomDuration(180*time.Millisecond, 620*time.Millisecond))
+	}
+	if attempts > 0 {
+		// 用尽候选仍失败：说明验证码链路大概率已经被风控，记一次信号。
+		c.observe(mobile, antiban.SignalCaptcha)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("captcha verify failed")
@@ -102,7 +197,7 @@ func (c *Client) fetchCaptchaValidate(fixed FixedParams) (string, error) {
 	return "", lastErr
 }
 
-func (c *Client) verifyCaptchaAtX(cli *http.Client, referer, token string, x int) (string, error) {
+func (c *Client) verifyCaptchaAtX(cli *http.Client, mobile, ua, referer, token string, x int) (string, error) {
 	checkURL := "https://captcha.chaoxing.com/captcha/check/verification/result"
 	q2 := url.Values{}
 	q2.Set("callback", "cx_captcha_function")
@@ -114,8 +209,8 @@ func (c *Client) verifyCaptchaAtX(cli *http.Client, referer, token string, x int
 	q2.Set("runEnv", "10")
 	q2.Set("version", "1.1.20")
 	req2, _ := http.NewRequest(http.MethodGet, checkURL+"?"+q2.Encode(), nil)
-	setCaptchaHeaders(req2, referer)
-	resp2, err := cli.Do(req2)
+	setCaptchaHeaders(req2, referer, ua)
+	resp2, err := c.do(context.Background(), mobile, cli, req2)
 	if err != nil {
 		return "", err
 	}
@@ -147,10 +242,10 @@ func (c *Client) verifyCaptchaAtX(cli *http.Client, referer, token string, x int
 	return extra.Validate, nil
 }
 
-func (c *Client) downloadBytes(cli *http.Client, rawURL string, referer string) ([]byte, error) {
+func (c *Client) downloadBytes(cli *http.Client, mobile, ua, rawURL string, referer string) ([]byte, error) {
 	req, _ := http.NewRequest(http.MethodGet, rawURL, nil)
-	setCaptchaHeaders(req, referer)
-	resp, err := cli.Do(req)
+	setCaptchaHeaders(req, referer, ua)
+	resp, err := c.captchaImageRequest(cli, mobile, req)
 	if err != nil {
 		return nil, err
 	}
@@ -158,8 +253,13 @@ func (c *Client) downloadBytes(cli *http.Client, rawURL string, referer string) 
 	return io.ReadAll(resp.Body)
 }
 
-func setCaptchaHeaders(req *http.Request, referer string) {
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+// setCaptchaHeaders 使用与账号一致的 UA：验证码服务会按 UA 区分客户端，
+// 用一套浏览器 UA 反复刷滑块，比用 App UA 更容易被判成脚本。
+func setCaptchaHeaders(req *http.Request, referer, ua string) {
+	if strings.TrimSpace(ua) == "" {
+		ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
+	}
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Accept", "*/*")
 }

@@ -1,12 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Compass, Info, LocateFixed, Loader2, MapPin, Search, Target, X } from 'lucide-react';
+import { Compass, Crosshair, Info, LocateFixed, Loader2, MapPin, Move, Search, Target, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 import config from '../../../config.yaml';
 import { distanceMeters, formatCoord, wgs84ToGcj02 } from '../../utils/coord';
 import type { LngLat } from '../../utils/coord';
 import { offsetMeters, solveSignCenter } from '../../utils/trilateration';
-import type { DistanceSample } from '../../utils/trilateration';
+import {
+  clearCalibrationSession,
+  loadCalibrationSession,
+  saveCalibrationSession,
+} from '../../utils/calibrationSession';
+import type { CalibrationSession } from '../../utils/calibrationSession';
 
 const AMAP_KEY: string = config.sign?.amap?.js_key || '';
 const AMAP_SECURITY_CODE: string = config.sign?.amap?.security_code || '';
@@ -32,6 +37,15 @@ const CALIBRATE_MAX_RUNS = 2;
  * 这种响应解不出圆心，随机间隔后重试一次往往就能拿到 errorLocation2_<米>。
  */
 const PROBE_MAX_ATTEMPTS = 2;
+
+/**
+ * 手动圈：后端没下发半径时用默认值画圈，用户再用滑杆微调。
+ * 刷新二维码的 enc 只有几秒有效期，自动校准在慢代理下很容易拿不到距离；
+ * 此时由用户直接把签到圈拖到老师所在位置，比反复探测更省时间。
+ */
+const MANUAL_DEFAULT_RADIUS = 500;
+const MANUAL_MIN_RADIUS = 20;
+const MANUAL_MAX_RADIUS = 3000;
 
 export interface MapPickerResult {
   name: string;
@@ -63,6 +77,12 @@ interface MapPickerProps {
    * 提供（它持有当前二维码 enc 与活动信息）。不传则不显示校准入口。
    */
   onProbeDistance?: (point: LngLat) => Promise<SignCenterProbe>;
+  /**
+   * 校准会话的持久化标识（一般传活动 id）。
+   * 手机拍照时页面可能被系统回收，重载后靠它把「已采集的探测距离」捞回来续传；
+   * 留空则只在内存里保留会话（关面板不丢，重载会丢）。
+   */
+  persistKey?: string;
   onClose: () => void;
   onConfirm: (result: MapPickerResult) => void;
 }
@@ -86,19 +106,6 @@ export interface SignCenterProbe {
    */
   needQr?: boolean;
   message?: string;
-}
-
-/**
- * 圆心校准会话：跨面板开关保留。
- * HTTP 手机页面没有摄像头权限，只能用「拍照 / 相册」一张一张导入二维码；
- * 刷新码每探测一次都要一张新码，所以必须把已采集的采样点保留下来，
- * 拍下一张回来后接着上次进度继续，而不是从第一次探测重新开始。
- */
-interface CalibrationSession {
-  /** 已经拿到距离的探测点（绝对坐标 + 距圆心米数） */
-  samples: DistanceSample[];
-  /** 本轮固定的三个探测点（顺序已打乱）。samples.length 就是下一个要探测的下标。 */
-  probes: { label: string; point: LngLat }[];
 }
 
 /** 兼容 AMap.LngLat 对象与 { lng, lat } 普通对象两种形态 */
@@ -246,9 +253,14 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   signAddress,
   refreshQr = false,
   onProbeDistance,
+  persistKey = '',
   onClose,
   onConfirm,
 }) => {
+  /** 校准会话的落盘标识（活动 id）：空串表示不落盘，只在内存里保留 */
+  const persistKeyRef = useRef(persistKey);
+  persistKeyRef.current = persistKey;
+
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const mapRef = useRef<any>(null);
@@ -261,8 +273,22 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   const searchTimerRef = useRef<number | null>(null);
   const signPointRef = useRef<LngLat | null>(null);
   const signAddressRef = useRef('');
-  /** 画/挪签到范围圈在 map 初始化闭包里定义，这里留一份供圆心校准复用 */
-  const showSignAreaRef = useRef<((pos: LngLat) => void) | null>(null);
+  /** 画/挪签到范围圈在 map 初始化闭包里定义，这里留一份供圆心校准 / 手动圈复用 */
+  const showSignAreaRef = useRef<
+    ((pos: LngLat, opts?: { recenter?: boolean; radius?: number }) => void) | null
+  >(null);
+  /** 高德命名空间：手动圈需要新建可拖拽图钉，回调里拿不到闭包变量 */
+  const amapRef = useRef<any>(null);
+  /** 手动圈的可拖拽圆心图钉（只在手动模式出现） */
+  const manualHandleRef = useRef<any>(null);
+  /** 手动模式开关的同步镜像：地图 click 回调是初始化时注册的，读 state 会拿到旧值 */
+  const manualModeRef = useRef(false);
+  /** 手动圈半径的同步镜像：同上，供点击/拖拽回调读取最新值 */
+  const manualRadiusRef = useRef(0);
+  /** 手动挪圆心：地图 click 回调注册在初始化闭包里，通过 ref 调用最新实现 */
+  const applyManualCenterRef = useRef<((pos: LngLat, opts?: { silent?: boolean }) => void) | null>(
+    null
+  );
   /** 校准取消标志：面板关闭时置 true，让正在跑的探测循环尽快退出 */
   const calibrateCancelledRef = useRef(false);
   /** 面板是否打开：异步探测循环用它判断用户是不是已经关面板去拍下一张二维码了 */
@@ -280,8 +306,18 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   const [locating, setLocating] = useState(false);
   const [signPoint, setSignPoint] = useState<LngLat | null>(null);
   const [signRadius, setSignRadius] = useState(0);
-  /** 圆心来源：api=后端下发经纬度，geocode=按 locationText 地址反查，calibrated=三边定位校准 */
-  const [signSource, setSignSource] = useState<'' | 'api' | 'geocode' | 'calibrated'>('');
+  /**
+   * 圆心来源：
+   * api=后端下发经纬度，geocode=按 locationText 地址反查，
+   * calibrated=三边定位校准，manual=用户手动拖动签到圈
+   */
+  const [signSource, setSignSource] = useState<'' | 'api' | 'geocode' | 'calibrated' | 'manual'>('');
+  /** 手动圈模式：开启后点地图 / 拖图钉直接挪签到圈，不再发任何探测请求 */
+  const [manualMode, setManualMode] = useState(false);
+  /** 手动圈的半径（米）：默认取后端下发值，没有则用 MANUAL_DEFAULT_RADIUS */
+  const [manualRadius, setManualRadius] = useState(0);
+  /** 自动校准拿不到距离：把「手动拖圈」作为下一步引导顶到按钮区 */
+  const [calibrateFailed, setCalibrateFailed] = useState(false);
   const [signGeocoding, setSignGeocoding] = useState(false);
   /** 反查圆心时命中的关键词（POI 名或整串地址），用于底部提示与排查 */
   const [signAnchor, setSignAnchor] = useState('');
@@ -293,19 +329,40 @@ export const MapPicker: React.FC<MapPickerProps> = ({
   /** 本次打开面板已经校准了几轮（每轮 3 次真实提交），用于限制总请求量 */
   const [calibrateRuns, setCalibrateRuns] = useState(0);
   /**
+   * setCalibrateRuns 的同步镜像：探测循环是异步的，读 state 会拿到旧值，
+   * 所以「还能不能开新一轮」和「会话里记录的轮次」都以 ref 为准。
+   */
+  const calibrateRunsRef = useRef(0);
+  const updateCalibrateRuns = (value: number) => {
+    calibrateRunsRef.current = value;
+    setCalibrateRuns(value);
+  };
+  /**
    * 圆心校准会话：放在组件级 ref 里，不随面板开关重置。
-   * 拍照模式下每次拍新码都要关面板，回来后续传靠它保留已采集的采样点。
+   * 拍照模式下每次拍新码都要关面板，回来后续传靠它保留已采集的采样点；
+   * 页面被系统回收重载时由 persistKey 从 localStorage 捞回来。
    */
   const calibrationSessionRef = useRef<CalibrationSession | null>(null);
   /** 会话的界面镜像：用于按钮显示「继续校准（n/3）」并触发重渲染 */
   const [pendingCalibration, setPendingCalibration] = useState<CalibrationSession | null>(null);
+  // 渲染期同步镜像：地图回调（初始化时注册）通过 ref 读最新值
+  manualModeRef.current = manualMode;
+  manualRadiusRef.current = manualRadius;
 
-  /** 更新/清空校准会话：ref 供异步循环读写，state 供界面显示进度 */
+  /**
+   * 更新/清空校准会话：ref 供异步循环读写，state 供界面显示进度，
+   * 同时落盘（活动 id + 采样点 + 轮次），保证页面重载后还能接着上一次的进度跑。
+   */
   const setCalibrationSession = (session: CalibrationSession | null) => {
     calibrationSessionRef.current = session;
     setPendingCalibration(
-      session ? { samples: [...session.samples], probes: session.probes } : null
+      session ? { samples: [...session.samples], probes: session.probes, runs: session.runs } : null
     );
+    if (session) {
+      saveCalibrationSession(persistKeyRef.current, session);
+    } else {
+      clearCalibrationSession();
+    }
   };
 
   const [keyword, setKeyword] = useState('');
@@ -360,14 +417,32 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     setCalibrating(false);
     setCalibrateStatus('');
     setCalibrateResidual(null);
-    setCalibrateRuns(0);
+    setCalibrateFailed(false);
+    setManualMode(false);
+    setManualRadius(teacherRange > 0 ? teacherRange : MANUAL_DEFAULT_RADIUS);
     calibrateCancelledRef.current = false;
     calibratedRef.current = false;
     userMovedRef.current = false;
 
-    // 拍照 / 相册模式：上一轮校准只做了部分探测就关面板去拍新码，
-    // 这里提示用户点「继续校准」接着上次，而不是从第一次重新开始。
+    // 页面被系统回收 / 用户刷新后，内存里的会话已经没了：先从 localStorage 捞回来。
+    // 活动 id 不匹配或超过有效期时 loadCalibrationSession 返回 null，并顺手清掉脏数据。
+    if (!calibrationSessionRef.current) {
+      const restored = loadCalibrationSession(persistKeyRef.current);
+      if (restored) {
+        setCalibrationSession(restored);
+        console.info(
+          '[MapPicker] 已恢复未完成的圆心校准:',
+          `${restored.samples.length}/${restored.probes.length}`,
+          `runs=${restored.runs}`
+        );
+      }
+    }
     const pending = calibrationSessionRef.current;
+    // 轮次跟着会话走：续传不能因为「重开面板」就把已经用掉的校准轮次清零
+    updateCalibrateRuns(pending?.runs ?? 0);
+
+    // 拍照 / 相册模式：上一轮校准只做了部分探测就关面板去拍新码（或页面被重载），
+    // 这里提示用户点「继续校准」接着上次，而不是从第一次重新开始。
     if (pending && pending.samples.length > 0) {
       toast(
         `检测到未完成的圆心校准（已完成 ${pending.samples.length}/${pending.probes.length} 次探测），点下方「继续校准」接着上次`,
@@ -421,11 +496,18 @@ export const MapPicker: React.FC<MapPickerProps> = ({
           resizeEnable: true,
         });
         mapRef.current = map;
+        amapRef.current = AMap;
 
         // 老师设置的签到范围：半径圈 + 圆心点，直接告诉用户该往哪选。
         // 圆心可能来自后端下发的经纬度，也可能是按 address 反查出来的。
-        const showSignArea = (pos: LngLat, opts?: { recenter?: boolean }) => {
-          const radius = teacherRange > 0 ? teacherRange : 500;
+        const showSignArea = (pos: LngLat, opts?: { recenter?: boolean; radius?: number }) => {
+          // 半径优先级：调用方显式指定（手动圈滑杆）> 后端下发 > 默认值
+          const radius =
+            opts?.radius && opts.radius > 0
+              ? opts.radius
+              : teacherRange > 0
+                ? teacherRange
+                : MANUAL_DEFAULT_RADIUS;
           if (circleRef.current) {
             circleRef.current.setCenter([pos.lng, pos.lat]);
             circleRef.current.setRadius(radius);
@@ -567,6 +649,11 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         map.on('click', (event: any) => {
           const pos = readLngLat(event?.lnglat);
           if (!pos) return;
+          // 手动圈模式：点地图挪的是“签到圈中心”，而不是用户提交的选点。
+          if (manualModeRef.current) {
+            applyManualCenterRef.current?.(pos);
+            return;
+          }
           marker.setPosition([pos.lng, pos.lat]);
           applyPosition(pos);
         });
@@ -618,6 +705,9 @@ export const MapPicker: React.FC<MapPickerProps> = ({
       markerRef.current = null;
       circleRef.current = null;
       centerDotRef.current = null;
+      amapRef.current = null;
+      manualHandleRef.current = null;
+      manualModeRef.current = false;
       geocoderRef.current = null;
       autoRef.current = null;
       placeSearchRef.current = null;
@@ -727,6 +817,123 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     toast.success('已定位到老师签到点附近');
   };
 
+  /**
+   * 手动圈：把签到圈中心挪到 pos（点地图 / 拖图钉都会走这里）。
+   *
+   * 只动本地视觉与回传圆心，不发任何网络请求——这正是刷新码校准
+   * 反复拿不到距离时的兜底：用户把圈拖到老师位置即可，不用等 enc。
+   */
+  const applyManualCenter = (pos: LngLat, opts?: { silent?: boolean }) => {
+    // 打上“圆心已确定”标记：迟到的地址反查不能再把圈拽回偏差几百米的坐标。
+    calibratedRef.current = true;
+    signPointRef.current = pos;
+    setSignPoint(pos);
+    setSignSource('manual');
+    setSignAnchor('');
+    setCalibrateResidual(null);
+
+    const radius =
+      manualRadiusRef.current > 0
+        ? manualRadiusRef.current
+        : Number(signRange) > 0
+          ? Number(signRange)
+          : MANUAL_DEFAULT_RADIUS;
+    showSignAreaRef.current?.(pos, { radius });
+    manualHandleRef.current?.setPosition?.([pos.lng, pos.lat]);
+
+    if (!opts?.silent) {
+      setName((prev) => prev || '手动指定的签到点');
+    }
+  };
+  applyManualCenterRef.current = applyManualCenter;
+
+  /** 手动圈的可拖拽图钉：只在手动模式出现，拖动即挪圆心 */
+  const ensureManualHandle = (pos: LngLat) => {
+    const AMap = amapRef.current;
+    const map = mapRef.current;
+    if (!AMap || !map) return;
+    if (!manualHandleRef.current) {
+      // 用 content 画一个橙色圆点：和默认蓝色大头针区分开，anchor=center 保证
+      // 拖动点就是圆心本身（默认图钉的锚点在底部，视觉上会偏半个图钉）。
+      const handle = new AMap.Marker({
+        position: [pos.lng, pos.lat],
+        draggable: true,
+        cursor: 'move',
+        zIndex: 30,
+        anchor: 'center',
+        content:
+          '<div style="width:16px;height:16px;border-radius:9999px;background:#f59e0b;border:3px solid #ffffff;box-shadow:0 1px 6px rgba(0,0,0,0.35)"></div>',
+        title: '拖动调整签到圈中心',
+      });
+      handle.on('dragend', (event: any) => {
+        const next = readLngLat(event?.lnglat);
+        if (next) applyManualCenter(next);
+      });
+      map.add(handle);
+      manualHandleRef.current = handle;
+    } else {
+      manualHandleRef.current.setPosition?.([pos.lng, pos.lat]);
+      manualHandleRef.current.show?.();
+    }
+  };
+
+  /** 进入手动圈模式：纯本地调整，不会对学习通发起任何请求 */
+  const enterManualMode = () => {
+    const seed = signPointRef.current ?? current;
+    manualModeRef.current = true;
+    setManualMode(true);
+    setCalibrateFailed(false);
+    setCalibrateStatus('');
+
+    const radius =
+      manualRadiusRef.current > 0
+        ? manualRadiusRef.current
+        : Number(signRange) > 0
+          ? Number(signRange)
+          : MANUAL_DEFAULT_RADIUS;
+    manualRadiusRef.current = radius;
+    setManualRadius(radius);
+
+    if (seed) {
+      applyManualCenter(seed, { silent: true });
+      ensureManualHandle(seed);
+    }
+    toast('手动圈：点地图或拖动橙色圆点，把签到圈放到老师的位置；拖好后可点「用签到点」', {
+      icon: '🎯',
+      id: 'manual-center',
+      duration: 6000,
+    });
+  };
+
+  /** 退出手动圈：图钉收起，圈和圆心保持用户最后摆放的位置 */
+  const exitManualMode = () => {
+    manualModeRef.current = false;
+    setManualMode(false);
+    manualHandleRef.current?.hide?.();
+
+    // 选点（真正提交的坐标）可能还停在原来的位置：提醒一步，避免摆完圈却从圈外提交。
+    const center = signPointRef.current;
+    const distance = center && current ? distanceMeters(current, center) : Number.NaN;
+    const radius = manualRadiusRef.current;
+    if (center && Number.isFinite(distance) && radius > 0 && distance > radius) {
+      toast(`当前选点还在圈外约 ${Math.round(distance)} 米，点「用签到点」可直接落到老师附近`, {
+        icon: '📍',
+        id: 'manual-center',
+        duration: 6000,
+      });
+      return;
+    }
+    toast.success('签到圈位置已固定', { id: 'manual-center', duration: 2500 });
+  };
+
+  /** 手动圈半径滑杆：只改圈的大小，不触发探测 */
+  const handleManualRadiusChange = (value: number) => {
+    const radius = Math.min(MANUAL_MAX_RADIUS, Math.max(MANUAL_MIN_RADIUS, Math.round(value)));
+    manualRadiusRef.current = radius;
+    setManualRadius(radius);
+    circleRef.current?.setRadius?.(radius);
+  };
+
   /** 随机等待并读秒（可被关闭面板打断）；返回 false 表示已取消 */
   const waitRandom = async (label: string, minMs = 4000, maxMs = 9000) => {
     const end = Date.now() + Math.round(minMs + Math.random() * (maxMs - minMs));
@@ -752,12 +959,21 @@ export const MapPicker: React.FC<MapPickerProps> = ({
    *
    * 可续传：手机 HTTP 页面只能拍照 / 相册导入二维码，刷新码每探测一次都要一张新码。
    * 探测返回 needQr 时本轮暂停，已采集的采样点和固定的三个探测点会保留在
-   * calibrationSessionRef 里；用户拍下一张回来点「继续校准」，从上次断点接着探测。
+   * calibrationSessionRef 里并落盘（persistKey=活动 id）；用户拍下一张回来点「继续校准」，
+   * 从上次断点接着探测。页面被相机打断重载后同样能续传。
    *
    * 探测点都在范围外，正常不会签到成功；万一某次恰好落在范围内，直接算签到成功。
    */
   const handleCalibrate = async () => {
     if (!onProbeDistance || calibrating) return;
+
+    // 开始自动校准：先收掉手动圈图钉，避免两种模式的操作互相干扰。
+    if (manualModeRef.current) {
+      manualModeRef.current = false;
+      setManualMode(false);
+      manualHandleRef.current?.hide?.();
+    }
+    setCalibrateFailed(false);
 
     // 有未完成的会话就接着上次跑，不需要重新选点，也不占用新的“校准轮次”。
     let session = calibrationSessionRef.current;
@@ -768,11 +984,13 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         return;
       }
       // 每轮校准 = 3 次真实提交。为避免对学习通造成高频请求，单次选点最多 2 轮。
-      if (calibrateRuns >= CALIBRATE_MAX_RUNS) {
+      // 用 ref 判断：异步循环里读 state 会拿到旧值，续传后容易多跑一轮。
+      if (calibrateRunsRef.current >= CALIBRATE_MAX_RUNS) {
         toast.error('本次选点已校准过，若仍不准请关闭面板重新打开后再试', { duration: 5000 });
         return;
       }
-      setCalibrateRuns((n) => n + 1);
+      const nextRuns = calibrateRunsRef.current + 1;
+      updateCalibrateRuns(nextRuns);
 
       // 两个偏移方向正交（保证三点不共线），整体随机旋转，避免每次探测点完全一致。
       const spin = Math.random() * Math.PI * 2;
@@ -795,7 +1013,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
         [probes[i], probes[j]] = [probes[j], probes[i]];
       }
 
-      session = { samples: [], probes };
+      session = { samples: [], probes, runs: nextRuns };
       setCalibrationSession(session);
     }
 
@@ -855,6 +1073,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
           } catch (error: any) {
             setCalibrateStatus('探测请求失败');
             toast.error(error?.message || '探测请求失败');
+            setCalibrateFailed(true);
             return;
           }
           if (calibrateCancelledRef.current) return;
@@ -864,13 +1083,26 @@ export const MapPicker: React.FC<MapPickerProps> = ({
             // 手上没有可用新码（拍照 / 相册模式）：暂停本轮，保留已采集的采样点，
             // 等用户拍下一张后回来点「继续校准」，从这一点接着探测。
             setCalibrationSession(session);
-            setCalibrateStatus(
-              `已保存 ${samples.length}/${probes.length} 次探测，请拍摄/导入下一张二维码后回来点「继续校准」`
-            );
-            toast(
-              `已保存 ${samples.length}/${probes.length} 次探测，请拍下一张二维码后回来继续校准`,
-              { icon: '📷', duration: 6000, id: 'calibrate-need-qr' }
-            );
+            setCalibrateFailed(true);
+            if (samples.length === 0) {
+              // 第一次探测就失败：刷新码的 enc 往往在这个往返里已经过期，
+              // 反复等新码只会继续卡住，直接把「手动拖圈」摆到用户面前。
+              setCalibrateStatus(
+                '第一次探测没拿到距离（刷新码可能已经过期），建议直接点上方「手动圈」把签到圈拖到老师位置'
+              );
+              toast(
+                '第一次探测没拿到距离：刷新码时效太短，直接点「手动圈」拖到老师位置更快',
+                { icon: '🎯', duration: 8000, id: 'calibrate-need-qr' }
+              );
+            } else {
+              setCalibrateStatus(
+                `已保存 ${samples.length}/${probes.length} 次探测，请拍摄/导入下一张二维码后回来点「继续校准」`
+              );
+              toast(
+                `已保存 ${samples.length}/${probes.length} 次探测，请拍下一张二维码后回来继续校准`,
+                { icon: '📷', duration: 6000, id: 'calibrate-need-qr' }
+              );
+            }
             return;
           }
           if (once.signed) break;
@@ -901,8 +1133,17 @@ export const MapPicker: React.FC<MapPickerProps> = ({
           // 用户已经关面板去拍照了：不要再弹错误打扰扫码
           if (!openRef.current) return;
           const reason = res.message || '学习通没有返回距离，无法校准圆心';
-          setCalibrateStatus(`${reason}（已采集 ${samples.length}/${probes.length}，可点「继续校准」重试）`);
-          toast.error(reason, { duration: 6000 });
+          const refreshed = res.refreshQr ?? isRefreshing;
+          setCalibrateFailed(true);
+          setCalibrateStatus(
+            `${reason}（已采集 ${samples.length}/${probes.length}，可点「继续校准」重试，或改用「手动圈」直接拖圈）`
+          );
+          toast.error(
+            refreshed
+              ? `${reason}。刷新二维码时效太短，可直接用「手动圈」把签到圈拖到老师位置`
+              : reason,
+            { duration: 7000 }
+          );
           // 保留已采集的采样点：偶发无距离时用户可以直接再点「继续校准」重试这一探测点
           setCalibrationSession(session);
           return;
@@ -968,8 +1209,18 @@ export const MapPicker: React.FC<MapPickerProps> = ({
 
   // 当前选点与签到圆心的距离：用于提示是否落在老师设置的半径内。
   const distanceToSign = signPoint && current ? distanceMeters(current, signPoint) : Number.NaN;
+  /**
+   * 用于提示的半径：优先用后端下发的真实签到范围；
+   * 后端没给（常见于只下发 locationText 的活动）时退到手动圈半径，
+   * 否则用户手动拖完圈完全看不到“在不在圈内”的反馈。
+   */
+  const effectiveRange =
+    signRadius > 0 ? signRadius : signSource === 'manual' && manualRadius > 0 ? manualRadius : 0;
   const withinSignRange =
-    !!signPoint && Number.isFinite(distanceToSign) && signRadius > 0 && distanceToSign <= signRadius;
+    !!signPoint &&
+    Number.isFinite(distanceToSign) &&
+    effectiveRange > 0 &&
+    distanceToSign <= effectiveRange;
 
   const handleConfirm = () => {
     if (!current) {
@@ -981,9 +1232,11 @@ export const MapPicker: React.FC<MapPickerProps> = ({
     setCalibrationSession(null);
 
     // 超出半径时给出明确提示，但仍允许提交（老师坐标本身也可能有偏差）。
-    if (signPoint && signRadius > 0 && Number.isFinite(distanceToSign) && distanceToSign > signRadius) {
+    if (signPoint && effectiveRange > 0 && Number.isFinite(distanceToSign) && distanceToSign > effectiveRange) {
       toast.error(
-        `当前选点距签到点约 ${Math.round(distanceToSign)} 米，超出 ${signRadius} 米签到范围，签到可能失败`,
+        `当前选点距签到点约 ${Math.round(distanceToSign)} 米，超出 ${Math.round(effectiveRange)} 米${
+          signRadius > 0 ? '签到' : '手动圈'
+        }范围，签到可能失败`,
         { id: 'sign-range-warn', duration: 4000 }
       );
     }
@@ -1101,6 +1354,54 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                 用签到点
               </button>
             )}
+
+            {/*
+              手动圈：刷新二维码的 enc 只有几秒有效期，自动校准在慢代理下
+              常常拿不到距离；这里让用户直接把签到圈拖到老师位置，纯本地操作。
+            */}
+            <button
+              type="button"
+              onClick={manualMode ? exitManualMode : enterManualMode}
+              disabled={!ready || calibrating}
+              title="点地图或拖动橙色圆点，手动把签到圈中心放到老师的位置（不发任何探测请求）"
+              className={`absolute right-4 ${
+                signPoint ? 'bottom-32' : 'bottom-20'
+              } h-9 px-3 rounded-full text-xs font-bold shadow-lg active:scale-95 transition-transform disabled:opacity-60 ${
+                manualMode
+                  ? 'bg-amber-500 text-white shadow-amber-500/30'
+                  : 'bg-white text-slate-700 border border-slate-100'
+              }`}
+            >
+              <span className="flex items-center gap-1">
+                <Move size={13} />
+                {manualMode ? '完成拖圈' : '手动圈'}
+              </span>
+            </button>
+
+            {/* 手动圈：半径滑杆 + 操作提示 */}
+            {manualMode && (
+              <div className="absolute left-4 right-4 top-3 z-10 rounded-2xl bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
+                <div className="flex items-center justify-between text-[11px] font-bold text-slate-600">
+                  <span className="flex items-center gap-1">
+                    <Crosshair size={12} className="text-amber-500" />
+                    签到圈半径
+                  </span>
+                  <span className="text-amber-600">{Math.round(manualRadius)} 米</span>
+                </div>
+                <input
+                  type="range"
+                  min={MANUAL_MIN_RADIUS}
+                  max={MANUAL_MAX_RADIUS}
+                  step={10}
+                  value={Math.round(manualRadius)}
+                  onChange={(event) => handleManualRadiusChange(Number(event.target.value))}
+                  className="mt-1 w-full accent-amber-500"
+                />
+                <p className="mt-1 text-[10px] leading-tight text-slate-400">
+                  点地图或拖动图钉，把签到圈中心放到老师所在位置
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="px-5 py-4 border-t border-slate-100 shrink-0 pb-[calc(16px+var(--sab))]">
@@ -1130,7 +1431,9 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                   {Number.isFinite(distanceToSign)
                     ? `距签到点约 ${Math.round(distanceToSign)} 米`
                     : '正在计算与签到点的距离'}
-                  {signRadius > 0 ? `（签到范围 ${signRadius} 米）` : ''}
+                  {effectiveRange > 0
+                    ? `（${signRadius > 0 ? '签到范围' : '手动圈半径'} ${Math.round(effectiveRange)} 米）`
+                    : ''}
                   {withinSignRange ? ' · 在范围内' : ' · 建议靠近圆心'}
                   {signSource === 'geocode'
                     ? ` · 按地址定位${signAnchor ? `：${signAnchor}` : ''}`
@@ -1138,6 +1441,7 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                   {signSource === 'calibrated'
                     ? ` · 已自动校准${calibrateResidual !== null ? `（残差 ${Math.round(calibrateResidual)} 米）` : ''}`
                     : ''}
+                  {signSource === 'manual' ? ' · 手动放置' : ''}
                 </span>
               </div>
             ) : signGeocoding ? (
@@ -1174,8 +1478,24 @@ export const MapPicker: React.FC<MapPickerProps> = ({
                 <span>
                   这是刷新二维码：校准期间请让摄像头一直对准二维码，每次探测会自动等一张新码（约 5~10 秒）。
                   若是拍照 / 相册导入，每探测一次都要再拍一张新码，已采集的进度会自动保留，拍完点「继续校准」即可。
+                  刷新码时效太短时自动校准可能拿不到距离，可直接用地图上的「手动圈」把签到圈拖到老师位置。
                 </span>
               </div>
+            )}
+
+            {/* 自动校准拿不到距离（刷新码最常见）：把手动拖圈作为推荐的下一步 */}
+            {calibrateFailed && !calibrating && !manualMode && (
+              <button
+                type="button"
+                onClick={enterManualMode}
+                disabled={!ready}
+                className="w-full mb-2 rounded-xl border-2 border-amber-200 bg-amber-50 py-2.5 text-[11px] font-bold text-amber-700 active:scale-[0.98] transition-transform disabled:opacity-60 disabled:active:scale-100"
+              >
+                <span className="flex items-center justify-center gap-1.5">
+                  <Move size={13} />
+                  拿不到距离？直接「手动拖动签到圈」更稳
+                </span>
+              </button>
             )}
 
             {/* 圆心校准：学习通不下发圆心经纬度，用 errorLocation2_<米> 的距离反馈反解真实圆心 */}

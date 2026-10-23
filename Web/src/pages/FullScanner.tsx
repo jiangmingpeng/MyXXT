@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronLeft, Camera, EyeOff, Eye, MapPin, CheckCircle2, ImagePlus, Loader2 } from 'lucide-react';
 import { Html5Qrcode, type CameraDevice } from 'html5-qrcode';
 import toast from 'react-hot-toast';
-import client from '../api/client';
+import client, { SIGN_TIMEOUT_MS } from '../api/client';
 import { useAuthStore } from '../store/auth';
 import { useSignStore } from '../store/sign';
 import { distanceMeters, formatCoord } from '../utils/coord';
@@ -12,9 +12,11 @@ import { ProgressCard } from '../components/sign/ProgressCard';
 import { MapPicker } from '../components/sign/MapPicker';
 import type { MapPickerResult } from '../components/sign/MapPicker';
 import type { ApiResponse, SignStatusMessage, Classmate, User, SignExecuteResult } from '../types';
-import { SIGN_ERR_QR_EXPIRED } from '../constants';
+import { SIGN_ERR_QR_EXPIRED, SIGN_ERR_RISK_BLOCKED } from '../constants';
 import scanCursor from '../assets/scan_cursor.png';
 import config from '../../config.yaml';
+import { mapWithConcurrency, SIGN_CONCURRENCY, SIGN_STAGGER_MS } from '../utils/concurrency';
+import { hasResumableCalibration } from '../utils/calibrationSession';
 
 const LOCATION_PRESETS = config.sign?.location_presets || [];
 
@@ -201,6 +203,12 @@ const FullScanner = () => {
   const selectedDeviceIdRef = useRef<string | null>(null);
 
   const { activity, selectedUids, classmates } = location.state || {};
+
+  /**
+   * 圆心校准会话的持久化键：按活动区分。
+   * 换一场活动（签到圆心不同）就丢弃上一场采集的探测距离，避免解出错误圆心。
+   */
+  const calibrationKey = activity?.active_id ? String(activity.active_id) : '';
 
   // 老师设置的签到圆心/半径（后端解析 getPPTActiveInfo 得到）。
   // 有值时地图会画半径圈；已选点若落在圈外，扫码后先引导重新选点。
@@ -717,12 +725,25 @@ const FullScanner = () => {
       const toSignUids = orderedTargetUids.filter(uid => !signedUids.has(uid));
       if (toSignUids.length === 0) return;
 
-      // 2. Concurrent execution with Retry Logic
-      await Promise.all(toSignUids.map(async (uid) => {
-        const MAX_RETRIES = 15;
+      // 2. 受限并发 + 随机抖动执行（避免同一毫秒对多个账号发起请求）
+      await mapWithConcurrency(toSignUids, async (uid) => {
+        // 刷新码的 enc 只有几秒有效期，拿旧 enc 重试只会白白烧掉窗口；
+        // 旧值 15 次重试 × 每次最长 10s 超时，会把单个账号拖到 150s，
+        // 期间并发槽一直被占着，后面的同学只能干等。
+        const isRefreshQr = !!activity.if_refresh_ewm || !!initialQr.c;
+        const MAX_RETRIES = isRefreshQr ? 3 : 5;
+        // 单个账号的总重试预算：超预算直接失败，把并发槽让给其他同学。
+        const retryDeadline = Date.now() + (isRefreshQr ? 25000 : 40000);
         let lastError = '';
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
           if (!isExecutingRef.current) return;
+          if (attempt > 0 && Date.now() > retryDeadline) {
+            setSignStatuses(prev => ({
+              ...prev,
+              [uid]: { ...prev[uid], status: 'failed', message: lastError || '签到超时，请重试' },
+            }));
+            return;
+          }
 
           const currentQr = latestQrDataRef.current || initialQr;
           setSignStatuses(prev => ({ 
@@ -760,9 +781,18 @@ const FullScanner = () => {
               course_id: activity.course_id, class_id: activity.class_id, if_refresh_ewm: activity.if_refresh_ewm,
               special_params
             }, {
+              timeout: SIGN_TIMEOUT_MS,
               signal: abortControllerRef.current?.signal
             });
             const res = execResp.data.data;
+            // 本地风控熔断：后端没有向学习通发请求，继续重试只会延长冷却时间。
+            if (res.code === SIGN_ERR_RISK_BLOCKED) {
+              setSignStatuses(prev => ({
+                ...prev,
+                [uid]: { status: 'failed', message: res.message || '该账号已触发风控保护，请稍后再试' },
+              }));
+              return;
+            }
             // 二维码已失效：立即终止该同学的重试循环，避免用旧 enc 空转。
             if (res.code === SIGN_ERR_QR_EXPIRED) {
               qrExpiredRef.current = true;
@@ -787,7 +817,6 @@ const FullScanner = () => {
             // 定时刷新二维码的 enc 只有几秒有效期：固定等待 1~2s 会直接吃掉刷新窗口。
             // 刷新码立即用下一次读数里的最新 enc 重试（留 150ms 防止空转）；
             // 静态码保持原有退避，避免对学习通造成无意义压力。
-            const isRefreshQr = !!currentQr.c || !!activity.if_refresh_ewm;
             const delay = isRefreshQr ? 150 : (attempt < 3 ? 1000 : 2000);
             for (let i = 0; i < delay; i += 100) {
               if (!isExecutingRef.current) return;
@@ -795,7 +824,12 @@ const FullScanner = () => {
             }
           } else setSignStatuses(prev => ({ ...prev, [uid]: { status: 'failed', message: lastError } }));
         }
-      }));
+      }, {
+        // 受限并发 + 随机抖动：避免同一毫秒把全班账号的请求一起打出去。
+        concurrency: SIGN_CONCURRENCY,
+        staggerMs: SIGN_STAGGER_MS,
+        signal: controller.signal,
+      });
     } catch (error: any) {
       if (error.name !== 'CanceledError' && error.name !== 'AbortError') {
         toast.error(error.message || '执行过程出错');
@@ -929,6 +963,10 @@ const FullScanner = () => {
         class_id: activity.class_id,
         if_refresh_ewm: activity.if_refresh_ewm,
         special_params: params,
+      }, {
+        // 探测和正式签到一样要跑完整链路，必须用签到专用超时，
+        // 否则 10s 掐断会让三边定位拿到一个假的「失败点」。
+        timeout: SIGN_TIMEOUT_MS,
       });
       return resp.data.data;
     };
@@ -1027,7 +1065,14 @@ const FullScanner = () => {
       signRangeMeters
     );
 
-    if (state.decided && !outsideRange) {
+    /**
+     * 上一轮圆心校准只做了一两个探测点（手机上拍照时页面被系统回收是常态），
+     * 这里必须把地图重新拉起来让用户点「继续校准」，否则会直接拿未校准的点提交，
+     * 白白浪费掉已经采集的距离。用户明确关掉过选点面板则尊重他的选择，照常提交。
+     */
+    const hasPendingCalibration = !skipAutoLocationPickerRef.current && hasResumableCalibration(calibrationKey);
+
+    if (state.decided && !outsideRange && !hasPendingCalibration) {
       handleExecute(qr);
       return;
     }
@@ -1711,6 +1756,7 @@ const FullScanner = () => {
         signRange={activity?.location_range}
         signAddress={activity?.location_address}
         refreshQr={!!activity?.if_refresh_ewm || !!latestQrData?.c}
+        persistKey={calibrationKey}
         onProbeDistance={probeSignCenterDistance}
         onClose={() => {
           setIsMapPickerOpen(false);

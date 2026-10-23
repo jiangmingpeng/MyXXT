@@ -84,6 +84,24 @@ CREATE INDEX IF NOT EXISTS idx_sign_records_activity_id ON sign_records (activit
 CREATE INDEX IF NOT EXISTS idx_sign_records_user_uid ON sign_records (user_uid);
 CREATE INDEX IF NOT EXISTS idx_whitelists_permission ON whitelists (permission);
 
+-- 7) 账号设备画像表（反风控核心）
+-- 同一账号在任何一次登录/签到里都必须表现为"同一台手机 + 同一个出口"，
+-- 否则指纹漂移本身就是一条明显的风控信号。
+CREATE TABLE IF NOT EXISTS account_profiles (
+  id BIGSERIAL PRIMARY KEY,
+  mobile VARCHAR(32) NOT NULL UNIQUE,
+  uid BIGINT NOT NULL DEFAULT 0,
+  device_model VARCHAR(64) NOT NULL DEFAULT '',
+  user_agent VARCHAR(1024) NOT NULL DEFAULT '',
+  device_code VARCHAR(64) NOT NULL DEFAULT '',
+  proxy_url VARCHAR(512) NOT NULL DEFAULT '',
+  exit_ip VARCHAR(64) NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_profiles_uid ON account_profiles (uid);
+
 COMMIT;
 
 -- 可选: 手动插入首个管理员白名单（若不插入，则首次登录会自动成为管理员）

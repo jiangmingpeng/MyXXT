@@ -2,8 +2,8 @@ package xxt
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"xbt2/server/internal/antiban"
 )
 
 const (
@@ -33,6 +35,26 @@ const (
 	captchaType  = "slide"
 )
 
+// Options 是构造 Client 的完整参数。
+type Options struct {
+	AESKey            string
+	FallbackUserAgent string
+	InsecureTLS       bool
+	ActiveFetchMax    int
+
+	// Guard 为反风控引擎；为 nil 时退化成"直连 + 不节流"的历史行为。
+	Guard antiban.Guard
+	// UnifyLoginUA 让登录请求也使用移动端 UA。
+	UnifyLoginUA bool
+	// ClientIPMode 控制 clientip 参数：empty / auto / fixed。
+	ClientIPMode  string
+	FixedClientIP string
+	// ExitIPProbeURL 用于 auto 模式探测代理出口 IP。
+	ExitIPProbeURL string
+	// LogPayloads 控制是否打印 enc / 完整 query 等敏感内容。
+	LogPayloads bool
+}
+
 type Client struct {
 	aesKey         string
 	mobileUA       string
@@ -40,6 +62,20 @@ type Client struct {
 	http           *http.Client
 	sessionMu      sync.Mutex
 	sessions       map[string]*Session
+
+	guard  antiban.Guard
+	exitIP *antiban.ExitIPResolver
+	opts   Options
+
+	// 每个代理都必须有独立的 Transport：共用会让不同出口复用同一条 TCP 连接，
+	// 等于把出口隔离打回成单 IP。
+	clientMu  sync.Mutex
+	httpByKey map[string]*http.Client
+
+	// 验证码预取单飞：同一活动 + 账号的并发抓取只会真正执行一次，
+	// 避免"预取失败后 Sign 再同步抓一遍"让单次签到耗时翻倍。
+	captchaMu      sync.Mutex
+	captchaFlights map[string]*captchaFlight
 }
 
 type Session struct {
@@ -49,7 +85,9 @@ type Session struct {
 	Name        string
 	Avatar      string
 	Fid         int64  // 学校（单位）id，来自登录后的 _fid cookie；二维码签到必须携带真实值。
-	DeviceCode  string // 设备标识，登录后生成一次，会话内保持稳定。
+	DeviceCode  string // 设备标识，账号级稳定，跨登录不变。
+	UserAgent   string // 账号专属 UA，与 DeviceCode 一起构成稳定设备指纹。
+	ProxyURL    string // 该账号固定使用的出口代理，空表示直连。
 	Jar         *cookiejar.Jar
 	LastLoginAt time.Time
 }
@@ -123,30 +161,230 @@ type FixedParams struct {
 	StrategyPara string
 }
 
+// New 保留旧签名，等价于"直连 + 无节流"，仅用于测试与降级。
 func New(aesKey, mobileUA string, insecureTLS bool, activeFetchMax int) *Client {
-	tr := &http.Transport{}
-	if insecureTLS {
-		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	return NewWithOptions(Options{
+		AESKey:            aesKey,
+		FallbackUserAgent: mobileUA,
+		InsecureTLS:       insecureTLS,
+		ActiveFetchMax:    activeFetchMax,
+	})
+}
+
+// NewWithOptions 构造带反风控能力的 Client。
+func NewWithOptions(o Options) *Client {
+	guard := o.Guard
+	baseUA := strings.TrimSpace(o.FallbackUserAgent)
+
+	if o.ActiveFetchMax <= 0 {
+		o.ActiveFetchMax = 20
 	}
-	if activeFetchMax <= 0 {
-		activeFetchMax = 20
+
+	// 直连 Transport：未配置代理、或代理不可用时使用。
+	direct, err := antiban.NewTransport("", o.InsecureTLS)
+	if err != nil {
+		// 只可能在配置损坏时发生，此时退回标准 Transport 保证服务可用。
+		direct = &http.Transport{}
 	}
-	return &Client{
-		aesKey:         aesKey,
-		mobileUA:       mobileUA,
-		activeFetchMax: activeFetchMax,
+
+	c := &Client{
+		aesKey:         o.AESKey,
+		mobileUA:       baseUA,
+		activeFetchMax: o.ActiveFetchMax,
+		opts:           o,
+		guard:          guard,
 		http: &http.Client{
 			Timeout:   20 * time.Second,
-			Transport: tr,
+			Transport: direct,
 		},
-		sessions: make(map[string]*Session),
+		sessions:  make(map[string]*Session),
+		httpByKey: make(map[string]*http.Client),
+		// 验证码单飞任务表按需惰性初始化（测试会直接构造 &Client{}）。
+		captchaFlights: make(map[string]*captchaFlight),
+	}
+	if guard != nil && guard.Enabled() {
+		c.exitIP = antiban.NewExitIPResolver(o.ExitIPProbeURL, o.InsecureTLS)
+	}
+	return c
+}
+
+// profileFor 返回账号的稳定画像；guard 为 nil 时给出一条"空画像"，
+// 后续逻辑会自动回退到全局 mobileUA 与直连。
+func (c *Client) profileFor(mobile string) antiban.Profile {
+	if c == nil || c.guard == nil {
+		return antiban.Profile{Mobile: mobile, UserAgent: c.mobileUA}
+	}
+	p := c.guard.ProfileFor(mobile)
+	if strings.TrimSpace(p.UserAgent) == "" {
+		p.UserAgent = c.mobileUA
+	}
+	return p
+}
+
+// uaForProfile 返回该账号应当使用的 UA。
+func (c *Client) uaForProfile(p antiban.Profile) string {
+	if v := strings.TrimSpace(p.UserAgent); v != "" {
+		return v
+	}
+	return c.mobileUA
+}
+
+// httpForProfile 返回绑定到该账号出口代理的 http.Client（不带 cookie jar）。
+func (c *Client) httpForProfile(p antiban.Profile) *http.Client {
+	proxyURL := strings.TrimSpace(p.ProxyURL)
+	if proxyURL == "" {
+		return c.http
+	}
+	key := proxyURL
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	if cli, ok := c.httpByKey[key]; ok {
+		return cli
+	}
+	tr, err := antiban.NewTransport(proxyURL, c.opts.InsecureTLS)
+	if err != nil {
+		log.Printf("[antiban] proxy %q invalid, fallback to direct: %v", redactProxy(proxyURL), err)
+		c.httpByKey[key] = c.http
+		return c.http
+	}
+	cli := &http.Client{Timeout: 20 * time.Second, Transport: tr}
+	c.httpByKey[key] = cli
+	return cli
+}
+
+// clientForSession 返回该会话专属的 http.Client（带上账号 cookie jar 与代理）。
+func (c *Client) clientForSession(s *Session) *http.Client {
+	cli := *c.httpForProfile(antiban.Profile{Mobile: s.Mobile, ProxyURL: s.ProxyURL, UserAgent: s.UserAgent})
+	cli.Jar = s.Jar
+	return &cli
+}
+
+// acquire 申请一次"写"请求许可（登录/预签到/签到）。
+func (c *Client) acquire(ctx context.Context, mobile string) (func(), error) {
+	if c == nil || c.guard == nil {
+		return func() {}, nil
+	}
+	return c.guard.Acquire(ctx, mobile)
+}
+
+// acquireRead 申请一次"读"请求许可（活动列表/详情）。
+func (c *Client) acquireRead(ctx context.Context, mobile string) (func(), error) {
+	if c == nil || c.guard == nil {
+		return func() {}, nil
+	}
+	return c.guard.AcquireRead(ctx, mobile)
+}
+
+// do 是所有"写"请求的统一入口：节流 → 发请求 → 上报风控信号。
+func (c *Client) do(ctx context.Context, mobile string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	return c.doWith(ctx, mobile, cli, req, c.acquire)
+}
+
+// doRead 是"读"请求入口：共享并发上限，但账号级间隔更短。
+func (c *Client) doRead(ctx context.Context, mobile string, cli *http.Client, req *http.Request) (*http.Response, error) {
+	return c.doWith(ctx, mobile, cli, req, c.acquireRead)
+}
+
+func (c *Client) doWith(
+	ctx context.Context,
+	mobile string,
+	cli *http.Client,
+	req *http.Request,
+	acquire func(context.Context, string) (func(), error),
+) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req = req.WithContext(ctx)
+
+	release, err := acquire(ctx, mobile)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	resp, err := cli.Do(req)
+	if err != nil {
+		c.observe(mobile, antiban.SignalTransient)
+		return nil, err
+	}
+	// 先按状态码做一层粗判，正文级判定在具体接口里补充。
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		c.observe(mobile, antiban.SignalRateLimited)
+	case resp.StatusCode == http.StatusForbidden:
+		c.observe(mobile, antiban.SignalBlocked)
+	case resp.StatusCode >= 500:
+		c.observe(mobile, antiban.SignalTransient)
+	}
+	return resp, nil
+}
+
+func (c *Client) observe(mobile string, sig antiban.Signal) {
+	if c == nil || c.guard == nil || sig == antiban.SignalNone {
+		return
+	}
+	c.guard.Observe(mobile, sig)
+}
+
+// clientIPValue 计算 stuSignajax 的 clientip 参数。
+//
+//   - empty：保持历史行为（空字符串），最稳；
+//   - fixed：使用配置里的固定 IP；
+//   - auto ：经代理探测真实出口 IP，让"IP 归属地"与请求来源一致。
+func (c *Client) clientIPValue(mobile string, p antiban.Profile) string {
+	switch strings.ToLower(strings.TrimSpace(c.opts.ClientIPMode)) {
+	case "fixed":
+		return strings.TrimSpace(c.opts.FixedClientIP)
+	case "auto":
+		if v := strings.TrimSpace(p.ExitIP); v != "" {
+			return v
+		}
+		if c.exitIP != nil && strings.TrimSpace(p.ProxyURL) != "" {
+			if ip := c.exitIP.Resolve(p.ProxyURL); ip != "" {
+				if e, ok := c.guard.(*antiban.Engine); ok {
+					e.SetExitIP(mobile, ip)
+				}
+				return ip
+			}
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+// applyDeviceHeaders 给请求补齐真实 App 会带的公共头。
+// 刻意不手工设置 Accept-Encoding：交给 Go 自动协商并透明解压，
+// 手工设置会导致 gzip 正文无法解压。
+func applyDeviceHeaders(req *http.Request, ua string) {
+	if req == nil {
+		return
+	}
+	if strings.TrimSpace(ua) != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "*/*")
+	}
+	if req.Header.Get("Connection") == "" {
+		req.Header.Set("Connection", "keep-alive")
 	}
 }
 
 func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
+	profile := c.profileFor(mobile)
 	jar, _ := cookiejar.New(nil)
-	cli := *c.http
+	cli := *c.httpForProfile(profile)
 	cli.Jar = jar
+	ua := c.uaForProfile(profile)
+
+	// 登录态也统一成移动端 UA：如果登录用浏览器 UA、后面签到用 App UA，
+	// 同一 cookie jar 里"客户端身份"前后不一致，本身就是一条异常信号。
+	loginUA := "Mozilla/5.0"
+	if c.opts.UnifyLoginUA {
+		loginUA = ua
+	}
 
 	form := url.Values{}
 	form.Set("fid", "-1")
@@ -161,8 +399,8 @@ func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
 	form.Set("independentNameId", "0")
 
 	req, _ := http.NewRequest(http.MethodPost, "https://passport2.chaoxing.com/fanyalogin?"+form.Encode(), nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, loginUA)
+	resp, err := c.do(context.Background(), mobile, &cli, req)
 	if err != nil {
 		return nil, err
 	}
@@ -179,8 +417,9 @@ func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
 	}
 
 	req2, _ := http.NewRequest(http.MethodGet, "http://i.chaoxing.com/base", nil)
-	req2.Header.Set("User-Agent", "Mozilla/5.0")
-	resp2, err := cli.Do(req2)
+	// 这一步是 webview 里的 HTML 页面，保持浏览器 UA 更自然，也能保证 HTML 结构稳定。
+	applyDeviceHeaders(req2, "Mozilla/5.0")
+	resp2, err := c.do(context.Background(), mobile, &cli, req2)
 	if err != nil {
 		return nil, err
 	}
@@ -223,11 +462,20 @@ func (c *Client) PreLogin(mobile, password string) (*LoginResult, error) {
 		Name:        name,
 		Avatar:      avatar,
 		Fid:         fid,
-		DeviceCode:  newDeviceCode(),
+		DeviceCode:  profile.DeviceCode,
+		UserAgent:   ua,
+		ProxyURL:    profile.ProxyURL,
 		Jar:         jar,
 		LastLoginAt: time.Now(),
 	}
 	c.sessionMu.Unlock()
+
+	// 让画像表记下 uid，方便后台按账号排查指纹。
+	if binder, ok := c.guard.(interface {
+		BindUID(mobile string, uid int64)
+	}); ok {
+		binder.BindUID(mobile, uid)
+	}
 
 	return &LoginResult{UID: uid, Name: name, Avatar: avatar}, nil
 }
@@ -253,13 +501,13 @@ func (c *Client) GetCourses(mobile, password string) ([]Course, error) {
 	if err != nil {
 		return nil, err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 
 	u := "https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&getTchClazzType=1&mcode="
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := cli.Do(req)
+	// 与签到请求保持同一设备身份：同一 cookie 会话里 UA 来回切换本身就是异常信号。
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.doRead(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return nil, err
 	}
@@ -333,13 +581,12 @@ func (c *Client) GetActives(mobile, password string, courseID, classID int64) ([
 	if err != nil {
 		return nil, err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 
 	u := fmt.Sprintf("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId=%d&classId=%d", courseID, classID)
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.doRead(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return nil, err
 	}
@@ -415,12 +662,11 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 	if err != nil {
 		return SignDetail{}, err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 	u := fmt.Sprintf("https://mobilelearn.chaoxing.com/newsign/signDetail?activePrimaryId=%d&type=1", activityID)
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.doRead(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return SignDetail{}, err
 	}
@@ -450,7 +696,7 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 	// 二维码签到 / 位置签到的距离校验要用到老师设置的签到圆心与半径，
 	// signDetail 多数情况下不返回，需要再拉一次 getPPTActiveInfo。
 	if detail.SignType == SignQRCode || detail.SignType == SignLocation {
-		if info, err := c.fetchActiveInfo(&cli, activityID); err != nil {
+		if info, err := c.fetchActiveInfo(&cli, s, activityID); err != nil {
 			log.Printf("[activeInfo] activity=%d err=%v", activityID, err)
 		} else {
 			applyLocationFields(&detail, info)
@@ -475,9 +721,9 @@ func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignD
 
 // fetchActiveInfo 拉取活动详情（getPPTActiveInfo），用于读取签到圆心与半径。
 // 该接口返回结构随版本变化，这里保留原始 map 交给 applyLocationFields 做兼容解析。
-func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string]interface{}, error) {
+func (c *Client) fetchActiveInfo(cli *http.Client, s *Session, activityID int64) (map[string]interface{}, error) {
 	base := fmt.Sprintf("https://mobilelearn.chaoxing.com/v2/apis/active/getPPTActiveInfo?activeId=%d", activityID)
-	payload, err := c.getActiveInfoJSON(cli, activityID, base)
+	payload, err := c.getActiveInfoJSON(cli, s, activityID, base)
 	if err != nil {
 		return nil, err
 	}
@@ -486,7 +732,7 @@ func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string
 	}
 	// 默认请求拿不到圆心时再带 ifgetrange=1 试一次：返回体里本身就带 ifgetrange 字段，
 	// 说明服务端支持“按需下发签到范围/圆心”。
-	retry, retryErr := c.getActiveInfoJSON(cli, activityID, base+"&ifgetrange=1")
+	retry, retryErr := c.getActiveInfoJSON(cli, s, activityID, base+"&ifgetrange=1")
 	if retryErr == nil {
 		if _, _, ok := locationPairFromAny(retry); ok {
 			return retry, nil
@@ -495,10 +741,10 @@ func (c *Client) fetchActiveInfo(cli *http.Client, activityID int64) (map[string
 	return payload, nil
 }
 
-func (c *Client) getActiveInfoJSON(cli *http.Client, activityID int64, u string) (map[string]interface{}, error) {
+func (c *Client) getActiveInfoJSON(cli *http.Client, s *Session, activityID int64, u string) (map[string]interface{}, error) {
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.doRead(context.Background(), s.Mobile, cli, req)
 	if err != nil {
 		return nil, err
 	}
@@ -657,8 +903,7 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	if err != nil {
 		return err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 
 	vals := url.Values{}
 	vals.Set("courseId", strconv.FormatInt(fixed.CourseID, 10))
@@ -677,8 +922,8 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	}
 
 	req, _ := http.NewRequest(http.MethodGet, "https://mobilelearn.chaoxing.com/newsign/preSign?"+vals.Encode(), nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.do(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return err
 	}
@@ -701,8 +946,8 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	a1Vals := buildAnalysisQuery(fixed.ActiveID, dbStrategy, strategyPara)
 	a1 := "https://mobilelearn.chaoxing.com/pptSign/analysis?" + a1Vals.Encode()
 	req2, _ := http.NewRequest(http.MethodGet, a1, nil)
-	req2.Header.Set("User-Agent", c.mobileUA)
-	resp2, err := cli.Do(req2)
+	applyDeviceHeaders(req2, s.UserAgent)
+	resp2, err := c.do(context.Background(), s.Mobile, &cli, req2)
 	if err != nil {
 		return err
 	}
@@ -723,8 +968,8 @@ func (c *Client) PreSign(mobile, password string, fixed FixedParams, code, enc s
 	a2Vals.Set("code", code2)
 	a2 := "https://mobilelearn.chaoxing.com/pptSign/analysis2?" + a2Vals.Encode()
 	req3, _ := http.NewRequest(http.MethodGet, a2, nil)
-	req3.Header.Set("User-Agent", c.mobileUA)
-	resp3, err := cli.Do(req3)
+	applyDeviceHeaders(req3, s.UserAgent)
+	resp3, err := c.do(context.Background(), s.Mobile, &cli, req3)
 	if err == nil {
 		_, _ = io.Copy(io.Discard, resp3.Body)
 		resp3.Body.Close()
@@ -737,12 +982,11 @@ func (c *Client) GetPanUploadToken(mobile, password string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 
 	req, _ := http.NewRequest(http.MethodGet, "https://pan-yz.chaoxing.com/api/token/uservalid", nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.doRead(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return "", err
 	}
@@ -799,13 +1043,12 @@ func (c *Client) UploadPanFile(mobile, password, filename, contentType string, d
 		return "", err
 	}
 
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 	uploadURL := "https://pan-yz.chaoxing.com/upload?_from=mobilelearn&_token=" + url.QueryEscape(token)
 	req, _ := http.NewRequest(http.MethodPost, uploadURL, &body)
-	req.Header.Set("User-Agent", c.mobileUA)
+	applyDeviceHeaders(req, s.UserAgent)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := cli.Do(req)
+	resp, err := c.do(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
 		return "", err
 	}
@@ -839,13 +1082,12 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 	if err != nil {
 		return "", err
 	}
-	cli := *c.http
-	cli.Jar = s.Jar
+	cli := *c.clientForSession(s)
 
 	params := url.Values{}
 	params.Set("activeId", strconv.FormatInt(fixed.ActiveID, 10))
 	params.Set("uid", strconv.FormatInt(fixed.UID, 10))
-	params.Set("clientip", "")
+	params.Set("clientip", c.clientIPValue(s.Mobile, c.profileFor(s.Mobile)))
 	params.Set("appType", "15")
 	params.Set("fid", "")
 	params.Set("name", s.Name)
@@ -913,8 +1155,8 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 		if signType == SignGesture {
 			checkURL := fmt.Sprintf("https://mobilelearn.chaoxing.com/widget/sign/pcStuSignController/checkSignCode?activeId=%d&signCode=%s", fixed.ActiveID, url.QueryEscape(signCode))
 			reqC, _ := http.NewRequest(http.MethodGet, checkURL, nil)
-			reqC.Header.Set("User-Agent", c.mobileUA)
-			respC, err := cli.Do(reqC)
+			applyDeviceHeaders(reqC, s.UserAgent)
+			respC, err := c.do(context.Background(), s.Mobile, &cli, reqC)
 			if err == nil {
 				defer respC.Body.Close()
 				var check struct {
@@ -951,10 +1193,12 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 	// 这里与 1.0 行为对齐：二维码签到首发请求直接携带验证码。
 	if signType == SignQRCode {
 		// 调用方（SignService）会把预抓的验证码放进 special["validate"]，
-		// 让它与预签到并行完成；只有没预抓到时才在这里同步抓取兜底。
+		// 让它与预签到并行完成；只有没预抓到时才在这里兜底。
+		// 兜底同样走单飞：如果预取还在途就等同一个结果，失败则快速返回，
+		// 不再重复解一遍验证码（那会让单次签到耗时翻倍）。
 		validate := strVal(special["validate"])
 		if validate == "" {
-			v, err := c.fetchCaptchaValidate(fixed)
+			v, err := c.awaitCaptchaPrefetch(s.Mobile, fixed)
 			if err != nil {
 				log.Printf("captcha fetch failed before qrcode sign: activity=%d uid=%d err=%v", fixed.ActiveID, fixed.UID, err)
 			} else {
@@ -964,10 +1208,10 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 		if validate != "" {
 			params.Set("validate", validate)
 		}
-		return c.doStuSignRequest(&cli, params)
+		return c.doStuSignRequest(&cli, s, params)
 	}
 
-	result, err := c.doStuSignRequest(&cli, params)
+	result, err := c.doStuSignRequest(&cli, s, params)
 	if err != nil {
 		return "", err
 	}
@@ -976,35 +1220,42 @@ func (c *Client) Sign(mobile, password string, fixed FixedParams, signType int, 
 	}
 
 	// 仅对需要验证码的活动执行一次验证码识别，不在后端重试。
-	validate, err := c.fetchCaptchaValidate(fixed)
+	validate, err := c.fetchCaptchaValidate(s.Mobile, fixed)
 	if err != nil {
 		log.Printf("captcha fetch failed: activity=%d uid=%d err=%v", fixed.ActiveID, fixed.UID, err)
 		return "validate", nil
 	}
 	params.Set("validate", validate)
-	return c.doStuSignRequest(&cli, params)
+	return c.doStuSignRequest(&cli, s, params)
 }
 
-func (c *Client) doStuSignRequest(cli *http.Client, params url.Values) (string, error) {
+func (c *Client) doStuSignRequest(cli *http.Client, s *Session, params url.Values) (string, error) {
 	u := "https://mobilelearn.chaoxing.com/pptSign/stuSignajax?" + params.Encode()
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", c.mobileUA)
-	resp, err := cli.Do(req)
+	applyDeviceHeaders(req, s.UserAgent)
+	resp, err := c.do(context.Background(), s.Mobile, cli, req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := strings.TrimSpace(string(body))
+
+	// 正文级风控判定：这一步是熔断器最重要的输入。
+	c.observe(s.Mobile, antiban.ClassifySignBody(resp.StatusCode, bodyStr))
+
 	// 便于排查二维码 enc 失效、定位参数缺失等场景：打印学习通原始返回。
+	// enc / validate 属敏感内容，默认脱敏；排障时可用 antiban.log_payloads 打开。
 	log.Printf("[stuSignajax] activeId=%s uid=%s enc=%s validate=%t location=%s latitude=%q longitude=%q body=%q",
 		params.Get("activeId"), params.Get("uid"),
-		truncateForLog(params.Get("enc"), 24), params.Get("validate") != "",
-		truncateForLog(params.Get("location"), 600),
+		c.logValue(params.Get("enc"), 12), params.Get("validate") != "",
+		c.logValue(params.Get("location"), 600),
 		params.Get("latitude"), params.Get("longitude"),
 		truncateForLog(bodyStr, 500))
-	// 完整 query（含 location）便于对照学习通定位校验。
-	log.Printf("[stuSignajax] full_query=%s", truncateForLog(params.Encode(), 2000))
+	if c.opts.LogPayloads {
+		// 完整 query（含 location）便于对照学习通定位校验。
+		log.Printf("[stuSignajax] full_query=%s", truncateForLog(params.Encode(), 2000))
+	}
 	return bodyStr, nil
 }
 
@@ -1189,11 +1440,59 @@ func fidFromHTML(html string) int64 {
 	return v
 }
 
-// newDeviceCode 生成一次设备标识（32 位小写 hex），会话内保持不变。
+// newDeviceCode 生成一次随机设备标识（32 位小写 hex）。
+//
+// 注意：正式流程已改用账号级稳定的 antiban.StableDeviceCode，
+// 这里保留随机版本供测试/对比使用，不要再接回登录链路。
 func newDeviceCode() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Sprintf("%032x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// logValue 按配置决定是否打印敏感内容：
+// 关闭 log_payloads 时只保留尾部，避免把 enc / 定位串原样写进日志。
+func (c *Client) logValue(raw string, keep int) string {
+	if c != nil && c.opts.LogPayloads {
+		return truncateForLog(raw, keep)
+	}
+	return truncateForLog(maskSecret(raw), keep)
+}
+
+// maskSecret 保留前 4 位，其余替换为 *，用于 enc / deviceCode 等敏感值。
+func maskSecret(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 4 {
+		return "***"
+	}
+	return s[:4] + "***"
+}
+
+// redactProxy 隐藏代理地址里的账号密码，只保留 host:port。
+func redactProxy(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "***"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// sleepCtx 是可被取消的睡眠，用于验证码重试之间的随机停顿。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

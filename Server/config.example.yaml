@@ -1,0 +1,98 @@
+# 配置模板：复制为 config.yaml 后按需修改（config.yaml 已被 .gitignore 忽略，避免提交真实密钥）。
+#   cp config.example.yaml config.yaml
+
+# 当前环境 dev（本地开发建议改为 dev，日志更好看且更适合本地调试）
+app_env: dev
+
+# 端口号，默认为 3030
+http_addr: ":3030"
+
+# JWT 签名密钥，务必修改（随便写一串长一点的随机英文字母/数字）
+jwt_secret: "<请替换为随机长字符串>"
+
+# 账号密码加解密密钥，务必修改（随便写一串长一点的随机英文字母/数字）
+credential_secret: "<请替换为随机长字符串>"
+
+# 允许不安全的 TLS 连接（生产环境必须为 false）
+allow_insecure_tls: false
+
+# 学习通 AES 加密密钥，无需修改
+chaoxing_aes_key: "u2oh6Vu^HWe4_AES"
+
+# 请求学习通的 User-Agent，保持默认
+chaoxing_user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; Redmi K20 Pro Build/UKQ1.230804.001) (schild:0945de15614364966e17460057ab5aa6) (device:Redmi K20 Pro) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_aa664e5fbb1d46df8e5aa65f62a438d8"
+
+# 每门课程返回给前端的活动上限（默认 5）
+activity_list_limit: 5
+
+# ============================================================================
+# 反风控配置（设备指纹 / 出口代理 / 请求节流 / 风控熔断）
+# ============================================================================
+# 说明：
+#   学习通判定"脚本批量签到"的核心特征不是加密参数，而是
+#   「同一出口 IP + 同一设备指纹 + 同一毫秒大批量请求 + 验证码穷举」。
+#   下面每一项都对应消除其中一条特征。
+antiban:
+  # 总开关。false 只建议在本地排障时使用。
+  enabled: true
+
+  # 出口代理池，支持 http / https / socks5：
+  #   - "http://user:pass@residential-proxy:8080"
+  #   - "socks5://user:pass@1.2.3.4:1080"
+  # 同一账号会按 mobile 哈希固定落到其中一个出口，不会每次请求换 IP。
+  # 留空 = 直连本机出口（风险最高，仅本地调试）。
+  proxy_pool: []
+  #   - "http://user:pass@proxy-a.example.com:8080"
+  #   - "http://user:pass@proxy-b.example.com:8080"
+
+  # 同一时刻最多允许在途的学习通请求数（全局硬上限）。
+  max_concurrency: 2
+  # 同一账号连续两次"写"请求（登录 / 预签到 / 签到）之间的随机间隔（毫秒）。
+  min_interval_ms: 300
+  max_interval_ms: 1200
+  # 同一账号连续两次"读"请求（活动列表 / 活动详情）之间的随机间隔（毫秒）。
+  # 读请求量大但不动账号状态，间隔必须比写请求短，否则活动列表首屏会明显变慢。
+  read_min_interval_ms: 80
+  read_max_interval_ms: 240
+
+  # 单次滑动验证码最多尝试的滑块位置个数。
+  # 旧实现最多试 40 个坐标，等于把"机器人穷举"写在脸上。
+  captcha_max_attempts: 8
+
+  # 账号级熔断：风控信号权重累计到阈值后，该账号冷却 N 秒（重复触发指数增长）。
+  breaker_threshold: 4
+  breaker_cooldown_sec: 90
+
+  # 设备指纹池：账号按 mobile 哈希固定分配一台"手机"，并落库长期保持。
+  # 留空则所有账号共用下面的 chaoxing_user_agent（等于所有账号是同一台手机）。
+  device_templates:
+    - model: "Redmi K20 Pro"
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; Redmi K20 Pro Build/UKQ1.230804.001) (schild:0945de15614364966e17460057ab5aa6) (device:Redmi K20 Pro) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_aa664e5fbb1d46df8e5aa65f62a438d8"
+    - model: "Xiaomi 13"
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; Xiaomi 13 Build/UKQ1.231003.002) (schild:4c1f7d2a9e83b6f05d12a7c8e91b3f60) (device:Xiaomi 13) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_7b2e49c1d8f35a60b7c4e1928ad6f3b5"
+    - model: "OPPO Reno8"
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 13; OPPO Reno8 Build/TP1A.220905.001) (schild:a17c93e0d5b28f46c3a9e71b0d84f256) (device:OPPO Reno8) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_e3f90b7a1c46d8529f0b7e3c6a1d948f"
+    - model: "vivo X80"
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 13; vivo X80 Build/TP1A.220624.014) (schild:8d4b6f19c2a735e08f1b9d6c4a2e7531) (device:vivo X80) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_5c8a3f0b7d19e4268b0c5a7f91d34e68"
+    - model: "Redmi Note 12 Turbo"
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; Redmi Note 12 Turbo Build/UKQ1.231011.001) (schild:2f8e1c7d94b0a563e8d1f47c9b052a73) (device:Redmi Note 12 Turbo) Language/zh_CN com.chaoxing.mobile/ChaoXingStudy_3_6.4.8_android_phone_10834_264 (@Kalimdor)_9a4d7c2e58b1f06d3c7e9a2b4f81d05c"
+
+  # 登录请求也使用移动端 UA，避免"登录像浏览器、签到像 App"的身份割裂。
+  unify_login_ua: true
+
+  # stuSignajax 的 clientip 参数：
+  #   empty = 保持历史行为（空字符串，最稳）
+  #   auto  = 经代理探测真实出口 IP（需要代理可用）
+  #   fixed = 使用下面的 client_ip
+  client_ip_mode: "empty"
+  client_ip: ""
+  # auto 模式下探测出口 IP 的地址。
+  exit_ip_probe_url: "https://ifconfig.me/ip"
+
+  # 是否在日志里打印 enc / 完整 query 等敏感内容。生产环境请保持 false。
+  log_payloads: false
+
+
+# ⚠️ 核心修改点：postgres 数据库连接字符串
+# 如果你改过密码，请把 your_password 换成你真实的密码！
+postgres_dsn: "host=127.0.0.1 port=5432 user=<db_user> password=<db_password> dbname=<db_name> sslmode=disable TimeZone=Asia/Shanghai"

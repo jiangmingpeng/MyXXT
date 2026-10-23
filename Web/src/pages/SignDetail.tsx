@@ -16,11 +16,13 @@ import {
   RectangleEllipsis
 } from 'lucide-react';
 import toast from 'react-hot-toast';
-import client from '../api/client';
+import client, { SIGN_TIMEOUT_MS } from '../api/client';
 import { useAuthStore } from '../store/auth';
 import type { ApiResponse, Classmate, SignActivity, CourseActivities, SignStatusMessage, SignCheckItem } from '../types';
 import config from '../../config.yaml';
 import { useSignStore } from '../store/sign';
+import { mapWithConcurrency, SIGN_CONCURRENCY, SIGN_STAGGER_MS } from '../utils/concurrency';
+import { SIGN_ERR_RISK_BLOCKED } from '../constants';
 
 // Import refactored components
 import { GestureInput } from '../components/sign/GestureInput';
@@ -338,13 +340,23 @@ const SignDetail = () => {
         return;
       }
 
-      // 2. Concurrent execution with Retry Logic (5 times)
-      await Promise.all(toSignUids.map(async (uid) => {
+      // 2. 受限并发 + 随机抖动执行（避免同一毫秒对多个账号发起请求）
+      await mapWithConcurrency(toSignUids, async (uid) => {
         const MAX_RETRIES = 5;
+        // 单个账号的总重试预算：超过就把并发槽让给其他同学，
+        // 避免一次超时 + 多次重试把整批签到拖成几分钟。
+        const retryDeadline = Date.now() + 40000;
         let lastError = '';
         
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
           if (!isExecutingRef.current) return;
+          if (attempt > 0 && Date.now() > retryDeadline) {
+            setSignStatuses(prev => ({
+              ...prev,
+              [uid]: { ...prev[uid], status: 'failed', message: lastError || '签到超时，请重试' },
+            }));
+            return;
+          }
 
           setSignStatuses(prev => ({ 
             ...prev, 
@@ -394,6 +406,7 @@ const SignDetail = () => {
                 formData.append('file', assignedPhotoFile);
                 return formData;
               })(), {
+                timeout: SIGN_TIMEOUT_MS,
                 signal: abortControllerRef.current?.signal
               })
               : await client.post<ApiResponse<any>>('/sign/execute', {
@@ -401,10 +414,19 @@ const SignDetail = () => {
                 course_id: activity.course_id, class_id: activity.class_id, if_refresh_ewm: activity.if_refresh_ewm,
                 special_params
               }, {
+                timeout: SIGN_TIMEOUT_MS,
                 signal: abortControllerRef.current?.signal
               });
 
             const res = execResp.data.data;
+            // 本地风控熔断：后端没有向学习通发请求，继续重试只会延长冷却时间。
+            if (res.code === SIGN_ERR_RISK_BLOCKED) {
+              setSignStatuses(prev => ({
+                ...prev,
+                [uid]: { status: 'failed', message: res.message || '该账号已触发风控保护，请稍后再试' },
+              }));
+              return;
+            }
             if (res.success || res.already_signed) {
               if (uid !== currentUser?.uid) {
                 setClassmateSignStates(prev => ({
@@ -450,7 +472,11 @@ const SignDetail = () => {
             }));
           }
         }
-      }));
+      }, {
+        concurrency: SIGN_CONCURRENCY,
+        staggerMs: SIGN_STAGGER_MS,
+        signal: abortControllerRef.current?.signal,
+      });
     } catch (error: any) {
       if (error.name !== 'CanceledError' && error.name !== 'AbortError') {
         toast.error(error.message || '执行过程出错');

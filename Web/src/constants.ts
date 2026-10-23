@@ -10,3 +10,8 @@ export const SIGN_ERR_QR_EXPIRED = 2001;
 export const SIGN_ERR_CREDENTIAL_EXPIRED = 2002;
 /** 签到活动已结束 */
 export const SIGN_ERR_SIGN_ENDED = 2003;
+/**
+ * 该账号触发了本地反风控熔断（后端未向学习通发请求）。
+ * 此时继续重试只会延长冷却时间，前端应立即停止该账号的重试循环。
+ */
+export const SIGN_ERR_RISK_BLOCKED = 2004;

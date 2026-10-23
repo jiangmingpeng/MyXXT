@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"xbt2/server/internal/antiban"
 	"xbt2/server/internal/config"
 	"xbt2/server/internal/db"
 	"xbt2/server/internal/handler"
@@ -25,13 +26,32 @@ func main() {
 
 	jwtSvc := service.NewJWTService(cfg.JWTSecret)
 	credentialCrypto := service.NewCredentialCrypto(cfg.CredentialSecret)
-	xxtClient := xxt.New(cfg.ChaoxingAESKey, cfg.ChaoxingUserAgent, cfg.AllowInsecureTLS, cfg.ActivityListLimit+1)
+
+	// 反风控引擎：设备指纹 + 出口代理 + 节流 + 熔断。
+	// 画像落库，保证重启/重新登录后仍是"同一台手机"。
+	profileStore := service.NewAccountProfileStore(database)
+	guard := antiban.New(cfg.Antiban.ToAntibanOptions(cfg.ChaoxingUserAgent), profileStore)
+
+	xxtClient := xxt.NewWithOptions(xxt.Options{
+		AESKey:            cfg.ChaoxingAESKey,
+		FallbackUserAgent: cfg.ChaoxingUserAgent,
+		InsecureTLS:       cfg.AllowInsecureTLS,
+		ActiveFetchMax:    cfg.ActivityListLimit + 1,
+		Guard:             guard,
+		UnifyLoginUA:      cfg.Antiban.IsUnifyLoginUA(),
+		ClientIPMode:      cfg.Antiban.ClientIPMode,
+		FixedClientIP:     cfg.Antiban.ClientIP,
+		ExitIPProbeURL:    cfg.Antiban.ExitIPProbeURL,
+		LogPayloads:       cfg.Antiban.LogPayloads,
+	})
 
 	authHandler := handler.NewAuthHandler(database, jwtSvc, credentialCrypto, xxtClient)
 	courseHandler := handler.NewCourseHandler(database, xxtClient, credentialCrypto)
-	signSvc := service.NewSignService(database, xxtClient, credentialCrypto)
+	signSvc := service.NewSignService(database, xxtClient, credentialCrypto, guard)
 	signHandler := handler.NewSignHandler(database, xxtClient, credentialCrypto, signSvc, cfg.ActivityListLimit)
 	whitelistHandler := handler.NewWhitelistHandler(database)
+
+	logAntiBanSummary(cfg, guard)
 
 	r := gin.Default()
 
@@ -103,5 +123,29 @@ func resolveGinMode(appEnv string) string {
 		fallthrough
 	default:
 		return gin.DebugMode
+	}
+}
+
+// logAntiBanSummary 在启动时打印一份"当前暴露面"摘要（不含任何密钥/代理账号）。
+// 目的是让部署者一眼看出风险等级：没有代理、并发过高、关闭熔断都会被点名。
+func logAntiBanSummary(cfg config.Config, guard *antiban.Engine) {
+	opts := guard.Options()
+	log.Printf("[antiban] enabled=%t proxies=%d max_concurrency=%d write_interval=%s~%s read_interval=%s~%s captcha_attempts=%d breaker=%.1f/%s fingerprints=%d clientip=%s unify_login_ua=%t",
+		opts.Enabled, len(opts.ProxyPool), opts.MaxConcurrency,
+		opts.MinInterval, opts.MaxInterval, opts.ReadMinInterval, opts.ReadMaxInterval,
+		opts.CaptchaMaxAttempts,
+		opts.BreakerThreshold, opts.BreakerCooldown, len(opts.DeviceTemplates),
+		cfg.Antiban.ClientIPMode, cfg.Antiban.IsUnifyLoginUA())
+
+	if len(opts.ProxyPool) == 0 {
+		log.Printf("[antiban] 警告：未配置代理，所有账号共用本机出口 IP —— 这是最容易被判定为批量操作的特征")
+	} else if len(opts.ProxyPool) < 3 {
+		log.Printf("[antiban] 提示：代理池只有 %d 个出口，账号较多时同 IP 并发仍然偏高", len(opts.ProxyPool))
+	}
+	if !opts.Enabled {
+		log.Printf("[antiban] 警告：反风控已关闭（antiban.enabled=false），节流与熔断不会生效")
+	}
+	if cfg.AllowInsecureTLS {
+		log.Printf("[antiban] 警告：allow_insecure_tls=true 会关闭证书校验，建议改为 false")
 	}
 }

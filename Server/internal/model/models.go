@@ -73,3 +73,30 @@ type SignRecord struct {
 	CreatedAt  time.Time `json:"-"`
 	UpdatedAt  time.Time `json:"-"`
 }
+
+// AccountProfile 持久化账号的"设备 + 出口"画像。
+//
+// 反风控的核心前提是"同一账号永远表现为同一台手机、同一个出口"：
+// 把指纹落库后，即使服务重启、会话过期、重新登录，
+// 学习通看到的仍然是同一台设备，而不是每次登录都换一台新手机。
+type AccountProfile struct {
+	ID     uint   `gorm:"primaryKey" json:"-"`
+	Mobile string `gorm:"size:32;unique;not null" json:"-"`
+	UID    int64  `gorm:"index" json:"-"`
+	// DeviceModel 是机型，例如 "Redmi K20 Pro"。
+	DeviceModel string `gorm:"size:64" json:"-"`
+	// UserAgent 是该账号专属的完整 UA（含 schild / @Kalimdor 段）。
+	UserAgent string `gorm:"size:1024" json:"-"`
+	// DeviceCode 是账号级稳定的设备标识。
+	DeviceCode string `gorm:"size:64" json:"-"`
+	// ProxyURL 是该账号固定使用的出口代理，空表示直连。
+	ProxyURL string `gorm:"size:512" json:"-"`
+	// ExitIP 是代理实际出口 IP，供 clientip 参数使用。
+	ExitIP    string    `gorm:"size:64" json:"-"`
+	CreatedAt time.Time `json:"-"`
+	UpdatedAt time.Time `json:"-"`
+}
+
+func (AccountProfile) TableName() string {
+	return "account_profiles"
+}

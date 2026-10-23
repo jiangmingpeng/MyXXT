@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"xbt2/server/internal/antiban"
 	"xbt2/server/internal/common"
 	"xbt2/server/internal/model"
 	"xbt2/server/internal/xxt"
@@ -20,10 +20,40 @@ type SignService struct {
 	xxt      *xxt.Client
 	cc       *CredentialCrypto
 	encCache *CredentialCache
+	guard    antiban.Guard
 }
 
-func NewSignService(db *gorm.DB, xxtClient *xxt.Client, cc *CredentialCrypto) *SignService {
-	return &SignService{db: db, xxt: xxtClient, cc: cc, encCache: NewCredentialCache()}
+// NewSignService 构造签到服务。
+// guard 为 nil 时不做任何节流/熔断判断（仅用于单元测试）。
+func NewSignService(db *gorm.DB, xxtClient *xxt.Client, cc *CredentialCrypto, guard antiban.Guard) *SignService {
+	return &SignService{db: db, xxt: xxtClient, cc: cc, encCache: NewCredentialCache(), guard: guard}
+}
+
+// riskBlockedResult 把本地熔断状态翻译成前端可展示的结果。
+func riskBlockedResult(uid int64, remaining time.Duration) SignExecuteResult {
+	sec := int(remaining.Seconds())
+	if sec < 1 {
+		sec = 1
+	}
+	return SignExecuteResult{
+		UserID:  uid,
+		Success: false,
+		Code:    common.CodeRiskBlocked,
+		Message: fmt.Sprintf("该账号已触发风控保护，请在 %d 秒后再试（本次未向学习通发送请求）", sec),
+	}
+}
+
+// precheckRisk 在真正发请求之前做一次熔断判断。
+// 这一步的意义是：已经被学习通限流的账号，越重试越难恢复。
+func (s *SignService) precheckRisk(uid int64, mobile string) *SignExecuteResult {
+	if s.guard == nil {
+		return nil
+	}
+	if st := s.guard.Status(mobile); st.Blocked {
+		res := riskBlockedResult(uid, st.Remaining)
+		return &res
+	}
+	return nil
 }
 
 type ExecuteSignRequest struct {
@@ -112,6 +142,10 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 	if err != nil {
 		return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: "该同学登录信息已过期，请先重新登录"}
 	}
+	// 本地熔断检查：账号已在冷却期内时直接返回，不再打扰学习通。
+	if blocked := s.precheckRisk(req.TargetUID, target.Mobile); blocked != nil {
+		return *blocked
+	}
 
 	fixed := xxt.FixedParams{
 		ActiveID:     req.ActivityID,
@@ -166,31 +200,16 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 		}
 
 		// 刷新二维码的 enc 时效很短（约 5~10s），必须尽量压缩单次签到耗时。
-		// 预签到使用目标账号会话，验证码使用独立临时 cookie jar，两者互不依赖，可以安全并行。
-		// 验证码预抓失败时留空，xxt.Sign 内部会同步抓取兜底（只影响速度，不影响正确性）。
-		var (
-			preSignErr error
-			validate   string
-			captchaErr error
-		)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			preSignErr = s.xxt.PreSign(target.Mobile, password, fixed, qrCode, qrEnc)
-		}()
-		go func() {
-			defer wg.Done()
-			validate, captchaErr = s.xxt.FetchCaptchaValidate(fixed)
-		}()
-		wg.Wait()
+		// 验证码使用独立临时 cookie jar，与预签到互不依赖，所以先在后台单飞启动，
+		// 再同步做预签到；不再用 WaitGroup 等"两个都完成"，也不会在预取失败时
+		// 让 xxt.Sign 把整套验证码重解一遍。
+		stageStarted := time.Now()
+		s.xxt.StartCaptchaPrefetch(target.Mobile, fixed)
+		preSignErr := s.xxt.PreSign(target.Mobile, password, fixed, qrCode, qrEnc)
+		preSignCost := time.Since(stageStarted)
 
 		if preSignErr != nil {
 			return SignExecuteResult{UserID: req.TargetUID, Success: false, Message: "预签到失败，请重试"}
-		}
-		if captchaErr != nil {
-			log.Printf("[captcha] prefetch failed: activity=%d uid=%d err=%v", fixed.ActiveID, fixed.UID, captchaErr)
-			validate = ""
 		}
 		if req.Special == nil {
 			req.Special = map[string]interface{}{}
@@ -199,14 +218,29 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 		if qrCode != "" {
 			req.Special["c"] = qrCode
 		}
-		if validate != "" {
-			// 交给 xxt.Sign 复用，避免再串行抓一次验证码。
+		// 只取"已经算好"的验证码；还在途就留空，交给 xxt.Sign 内部等同一个任务。
+		prefetched := false
+		if validate, ok := s.xxt.TakePrefetchedCaptcha(target.Mobile, fixed); ok && validate != "" {
 			req.Special["validate"] = validate
+			prefetched = true
 		}
+		signStarted := time.Now()
+		defer func() {
+			log.Printf("[timing] qr sign activity=%d uid=%d preSign=%s prefetched=%t sign=%s total=%s",
+				fixed.ActiveID, fixed.UID,
+				preSignCost.Round(time.Millisecond), prefetched,
+				time.Since(signStarted).Round(time.Millisecond),
+				time.Since(stageStarted).Round(time.Millisecond))
+		}()
 	}
 
 	result, err := s.xxt.Sign(target.Mobile, password, fixed, req.SignType, req.Special)
 	if err != nil {
+		// 节流/熔断是在发请求阶段抛出的，属于"本地保护"，单独给错误码。
+		var blocked *antiban.BlockedError
+		if errors.As(err, &blocked) {
+			return riskBlockedResult(req.TargetUID, blocked.Remaining)
+		}
 		if req.SignType == xxt.SignQRCode && xxt.IsQRCodeExpired(err.Error()) {
 			s.encCache.DeleteIfEnc(req.ActivityID, qrEnc)
 			return SignExecuteResult{
@@ -223,6 +257,15 @@ func (s *SignService) ExecuteOne(operatorUID int64, req ExecuteSignRequest) Sign
 	}
 	result = strings.TrimSpace(result)
 	if result != "success" {
+		// 学习通已经明确提示账号异常/操作频繁时，继续重试只会让限制更久。
+		if antiban.IsBlocked(result) {
+			return SignExecuteResult{
+				UserID:  req.TargetUID,
+				Success: false,
+				Code:    common.CodeRiskBlocked,
+				Message: "该账号已被学习通限制，请暂停使用并稍后再试",
+			}
+		}
 		if strings.Contains(result, "您已签到过了") {
 			rec := model.SignRecord{UserUID: req.TargetUID, ActivityID: req.ActivityID, SourceUID: -1, SignTimeMS: time.Now().UnixMilli()}
 			_ = s.db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "user_uid"}, {Name: "activity_id"}}, DoNothing: true}).Create(&rec).Error

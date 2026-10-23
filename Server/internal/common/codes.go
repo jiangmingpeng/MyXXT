@@ -11,4 +11,7 @@ const (
 	CodeCredentialExpired = 2002
 	// CodeSignEnded 表示签到活动已结束。
 	CodeSignEnded = 2003
+	// CodeRiskBlocked 表示该账号触发本地反风控熔断，需等待冷却后再试。
+	// 该错误完全在本地产生，不会向学习通发请求。
+	CodeRiskBlocked = 2004
 )
