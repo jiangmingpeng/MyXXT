@@ -28,6 +28,50 @@ interface QrData {
   timestamp: number;
 }
 
+/**
+ * 正在等「下一张新码」的调用方（刷新码三边定位 / 圆心探测）。
+ * 新码到达、面板关闭、超时三种情况都会 settle，语义与旧的轮询返回值一致。
+ */
+type FreshEncWaiter = {
+  excludeEnc: string;
+  settle: (qr: QrData | null) => void;
+};
+
+/**
+ * 活动实时详情（后端 /sign/detail 只转发 newsign/signDetail）。
+ * 刷新码的 c 参数每换一张码就会变：sign_code 与手里的 c 不一致、或 if_over 置位，
+ * 就说明这张二维码已经失效，不必再拿它去提交。
+ */
+interface LiveSignDetail {
+  activity_id: number;
+  start_time: number;
+  end_time: number;
+  sign_type: number;
+  if_refresh_ewm: boolean;
+  if_over: boolean;
+  sign_code: string;
+}
+
+/** 主动过期探测间隔，对齐参考实现 expiredRefreshJob 的 1.5s。 */
+const QR_EXPIRY_PROBE_INTERVAL_MS = 1500;
+
+/**
+ * 拉一次活动的实时详情。
+ * 探测只是「顺手看一眼」，必须用短超时，不能和签到抢 SIGN_TIMEOUT_MS 的预算；
+ * 任何失败都静默返回 null，让下一轮继续探，不影响正常签到。
+ */
+const fetchLiveSignDetail = async (activityID: number, msg: string): Promise<LiveSignDetail | null> => {
+  try {
+    const resp = await client.get<ApiResponse<LiveSignDetail>>('/sign/detail', {
+      params: { activity_id: activityID, msg },
+      timeout: 4000,
+    });
+    return resp.data.data ?? null;
+  } catch {
+    return null;
+  }
+};
+
 type NativeCameraBridge = {
   isReady?: () => boolean;
   getCameraState?: () => string;
@@ -132,6 +176,20 @@ const FullScanner = () => {
   const isLocationSheetOpenRef = useRef(false);
   // 扫码时还没选点：暂存二维码，用户选完点后立即提交
   const pendingQrRef = useRef<QrData | null>(null);
+  /**
+   * 单槽等待器：同一时刻只允许一个流程在等「下一张新码」。
+   *
+   * 旧实现每 300ms 轮询一次 latestQrDataRef，最长空转 15s：新码其实早就扫到了，
+   * 却要等下一次轮询才能继续，白白烧掉刷新码本来就很短的 enc 窗口。
+   * 改成事件驱动后，扫码入口把新码推进来就立即唤醒，不再靠定时器猜。
+   */
+  const freshEncWaiterRef = useRef<FreshEncWaiter | null>(null);
+
+  /** 唤醒等待新 enc 的调用方（新码到达 / 面板关闭 / 超时）；settle 自己负责清 ref 与定时器。 */
+  const settleFreshEncWaiter = (qr: QrData | null) => {
+    const waiter = freshEncWaiterRef.current;
+    if (waiter) waiter.settle(qr);
+  };
   // 用户主动取消过地图选点后，不再自动弹窗，避免每次都打断扫码
   const skipAutoLocationPickerRef = useRef(false);
   const lastScanTimeRef = useRef<number>(0);
@@ -144,6 +202,9 @@ const FullScanner = () => {
   useEffect(() => {
     isMapPickerOpenRef.current = isMapPickerOpen;
     isLocationSheetOpenRef.current = isLocationPickerOpen;
+    // 面板关闭后不会再有新码进来：立刻唤醒等待方，让校准流程及时收尾，
+    // 不用等到 15s 超时才退出。
+    if (!isMapPickerOpen) settleFreshEncWaiter(null);
   }, [isMapPickerOpen, isLocationPickerOpen]);
   
   useEffect(() => {
@@ -167,6 +228,8 @@ const FullScanner = () => {
 
   useEffect(() => {
     return () => {
+      // 组件卸载时唤醒所有等待方，避免 Promise 永远挂着。
+      settleFreshEncWaiter(null);
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
       }
@@ -227,6 +290,19 @@ const FullScanner = () => {
     signRangeMeters
   );
   const latestQrDataRef = useRef<QrData | null>(null);
+
+  /**
+   * 把二维码同步到所有读取点，并在出现「还没用过的新码」时唤醒等待方。
+   * 扫码、相册导入、剪贴板粘贴都必须走这里，否则事件驱动的等待会漏掉入口。
+   */
+  const publishQrData = (qr: QrData) => {
+    latestQrDataRef.current = qr;
+    setLatestQrData(qr);
+    const waiter = freshEncWaiterRef.current;
+    if (waiter && qr.enc && qr.enc !== waiter.excludeEnc) {
+      settleFreshEncWaiter(qr);
+    }
+  };
   /** 上一次圆心探测用掉的二维码 enc（刷新码的 enc 时效很短，每次探测都必须换一张新码） */
   const probeLastEncRef = useRef<string>('');
   /**
@@ -689,6 +765,22 @@ const FullScanner = () => {
     return null;
   };
 
+  /**
+   * 把还没出结果的账号统一标成失败。
+   * 过期/中止后，排队中的账号会被重试循环直接 return，不会走到自己的失败分支，
+   * 不主动收尾就会让进度面板一直转圈。
+   */
+  const markUnfinishedTargetsFailed = (message: string) => {
+    setSignStatuses((prev) => {
+      const next: Record<number, Partial<SignStatusMessage>> = { ...prev };
+      Object.entries(next).forEach(([key, item]) => {
+        if (!item || item.status === 'success' || item.status === 'failed') return;
+        next[Number(key)] = { ...item, status: 'failed', message };
+      });
+      return next;
+    });
+  };
+
   const handleExecute = async (initialQr: QrData) => {
     if (isExecutingRef.current) return;
     setIsExecuting(true);
@@ -736,7 +828,8 @@ const FullScanner = () => {
         const retryDeadline = Date.now() + (isRefreshQr ? 25000 : 40000);
         let lastError = '';
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-          if (!isExecutingRef.current) return;
+          // 主动探测已经判定二维码失效时也要立刻退出，别再拿旧 enc 空转。
+          if (!isExecutingRef.current || qrExpiredRef.current) return;
           if (attempt > 0 && Date.now() > retryDeadline) {
             setSignStatuses(prev => ({
               ...prev,
@@ -799,6 +892,8 @@ const FullScanner = () => {
               setQrExpired(true);
               lastError = res.message || '二维码已过期，请重新扫码或粘贴';
               setSignStatuses(prev => ({ ...prev, [uid]: { status: 'failed', message: lastError } }));
+              // 其它排队中的账号也不用再拿旧 enc 试了，统一收尾。
+              markUnfinishedTargetsFailed(lastError);
               toast.error('二维码已过期，请重新粘贴或扫码', { id: 'qr-expired', duration: 5000 });
               return;
             }
@@ -819,7 +914,7 @@ const FullScanner = () => {
             // 静态码保持原有退避，避免对学习通造成无意义压力。
             const delay = isRefreshQr ? 150 : (attempt < 3 ? 1000 : 2000);
             for (let i = 0; i < delay; i += 100) {
-              if (!isExecutingRef.current) return;
+              if (!isExecutingRef.current || qrExpiredRef.current) return;
               await new Promise(resolve => setTimeout(resolve, 100));
             }
           } else setSignStatuses(prev => ({ ...prev, [uid]: { status: 'failed', message: lastError } }));
@@ -841,6 +936,76 @@ const FullScanner = () => {
       }
     }
   };
+
+  // 还有同学在排队 / 重试时才需要探过期；全部出结果后自动停，避免空转。
+  const hasPendingSign =
+    isExecuting &&
+    Object.values(signStatuses).some(
+      (item) => item?.status === 'pending' || item?.status === 'signing' || item?.status === 'retrying'
+    );
+
+  /**
+   * 主动过期探测（对齐参考实现 ChaoxingQRCodeSigner.isQRCodeExpired / expiredRefreshJob）。
+   *
+   * 刷新码的 c 参数每换一张码就会变。过去只能等 stuSignajax 回 2001 才知道
+   * 「这张码已经废了」，那时一次提交已经白白烧掉。这里在签到过程中每 1.5s
+   * 拉一次 signDetail：is_over 置位，或 sign_code 与手里这张不一致，就立即中止，
+   * 提示用户换码，不再拿旧 enc 一直空转到重试预算耗尽。
+   *
+   * 静态码没有 c，服务端也不会回 signCode，探测没有意义，直接跳过。
+   */
+  useEffect(() => {
+    const activityID = Number(activity?.active_id) || 0;
+    const qrCode = latestQrData?.c || '';
+    if (!hasPendingSign || activityID <= 0 || !qrCode) return;
+
+    let stopped = false;
+    let timer: number | null = null;
+
+    const sleep = (ms: number) =>
+      new Promise<void>((resolve) => {
+        timer = window.setTimeout(() => {
+          timer = null;
+          resolve();
+        }, ms);
+      });
+
+    const run = async () => {
+      while (!stopped) {
+        await sleep(QR_EXPIRY_PROBE_INTERVAL_MS);
+        if (stopped) return;
+        const detail = await fetchLiveSignDetail(activityID, qrCode);
+        // 探测失败（网络抖动 / 短超时）不改变任何状态，下一轮继续。
+        if (stopped || !detail) continue;
+
+        const over = detail.if_over === true;
+        // sign_code 为空说明服务端没回这个字段，不能当成「已变化」误杀。
+        const codeChanged = !!detail.sign_code && detail.sign_code !== qrCode;
+        if (!over && !codeChanged) continue;
+
+        stopped = true;
+        // 与 stuSignajax 返回 2001 时保持同一套状态：标记过期 + 中止在途请求。
+        // 不主动清 isExecutingRef，扫码入口会用「过期后扫到新码」的分支自动重开一轮。
+        qrExpiredRef.current = true;
+        setQrExpired(true);
+        toast.error(over ? '该签到已结束' : '二维码已失效，请重新扫码或粘贴', {
+          id: 'qr-expired',
+          duration: 5000,
+        });
+        // 中止在途请求后，没出结果的账号不会再被 catch 更新为失败，
+        // 这里主动收尾，避免进度面板一直转圈。
+        markUnfinishedTargetsFailed(over ? '签到已结束' : '二维码已失效，请重新扫码');
+        abortControllerRef.current?.abort();
+        return;
+      }
+    };
+
+    void run();
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [hasPendingSign, activity?.active_id, latestQrData?.c]);
 
   // 地图选点确认：写入 store（同时落到 localStorage）；
   // 若扫码时因尚未选点被挂起，选完立即提交，缩短 enc 的过期窗口。
@@ -892,32 +1057,45 @@ const FullScanner = () => {
    * 刷新码每张新码都会换 enc，且 enc 只有约 5~10 秒有效期；三边定位要连续提交
    * 三次，只能每次都用一张刚扫到的新码。
    *
+   * 实现是事件驱动的：扫码入口 publishQrData 时立即唤醒，面板关闭 / 组件卸载
+   * 会立刻按 null 结算，不再靠 300ms 轮询去猜新码到没到。
+   *
    * 返回 null 表示「手上没有可用新码」，由上层决定暂停续传还是放弃：
    *   - 面板已关闭；
    *   - 没有实时码流（HTTP 手机只能拍照 / 相册，每次拍完才有一张新码）；
    *   - 有实时码流但超时内没扫到新码。
    * 拍照模式下重新打开面板时，latestQrDataRef 已经是刚导入的那张新码，会直接命中。
    */
-  const waitForFreshEnc = async (excludeEnc: string, timeoutMs = 15000): Promise<QrData | null> => {
-    if (!isMapPickerOpenRef.current) return null;
+  const waitForFreshEnc = (excludeEnc: string, timeoutMs = 15000): Promise<QrData | null> => {
+    if (!isMapPickerOpenRef.current) return Promise.resolve(null);
 
     // 先看手上这张是不是「还没用过的新码」：拍照 / 相册导入后重新打开面板时，
     // 最新二维码已经换了 enc，直接用它，不必再等实时码流。
     const seen = latestQrDataRef.current || pendingQrRef.current;
-    if (seen?.enc && seen.enc !== excludeEnc) return seen;
+    if (seen?.enc && seen.enc !== excludeEnc) return Promise.resolve(seen);
 
     // 没有实时码流（HTTP 手机只能用拍照 / 相册）：等不到新码，
     // 交给上层暂停本轮校准，用户拍下一张后回来续传。
-    if (!hasLiveCameraRef.current) return null;
+    if (!hasLiveCameraRef.current) return Promise.resolve(null);
 
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (!isMapPickerOpenRef.current) return null;
-      const qr = latestQrDataRef.current || pendingQrRef.current;
-      if (qr?.enc && qr.enc !== excludeEnc) return qr;
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
-    }
-    return null;
+    return new Promise<QrData | null>((resolve) => {
+      let timer = 0;
+      const waiter: FreshEncWaiter = {
+        excludeEnc,
+        settle: (qr) => {
+          // 只允许当前登记的这个等待器结算，避免旧等待把新等待的结果吃掉。
+          if (freshEncWaiterRef.current !== waiter) return;
+          freshEncWaiterRef.current = null;
+          window.clearTimeout(timer);
+          resolve(qr);
+        },
+      };
+      // 单槽等待：上一次还没结束就重新等时，让旧等待立刻以 null 退出，
+      // 否则同一时刻会挂着两套回调，新码只能唤醒其中一个。
+      settleFreshEncWaiter(null);
+      timer = window.setTimeout(() => waiter.settle(null), timeoutMs);
+      freshEncWaiterRef.current = waiter;
+    });
   };
 
   /**
@@ -1118,8 +1296,7 @@ const FullScanner = () => {
     setQrExpired(false);
 
     lastScanTimeRef.current = 0;
-    latestQrDataRef.current = qr;
-    setLatestQrData(qr);
+    publishQrData(qr);
 
     if (isExecutingRef.current) {
       if (!wasExpired) return;
@@ -1143,8 +1320,7 @@ const FullScanner = () => {
     // 若这里直接 return，新的 enc 永远进不来，重试只会一直使用旧 enc。
     if (!latestQrDataRef.current || latestQrDataRef.current.enc !== qr.enc) {
       const wasExpired = qrExpiredRef.current;
-      latestQrDataRef.current = qr;
-      setLatestQrData(qr);
+      publishQrData(qr);
 
       // 上一轮因 enc 失效被终止时，扫到新的 enc 就自动重开一轮
       if (wasExpired && isExecutingRef.current) {

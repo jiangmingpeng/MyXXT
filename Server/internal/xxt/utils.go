@@ -3,6 +3,7 @@ package xxt
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -35,6 +36,23 @@ func strVal(v interface{}) string {
 		return ""
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// codeFromAny 把 signCode 这类「数字文本」还原成不带科学计数法的字符串。
+// 学习通有时把它作为 JSON number 下发，直接用 strVal 会得到 1.23456789e+12，
+// 与二维码里的 c 参数（纯数字文本）永远不相等，会被误判成二维码已过期。
+func codeFromAny(v interface{}) string {
+	switch n := v.(type) {
+	case float64:
+		if n == math.Trunc(n) && math.Abs(n) < 1e15 {
+			return strconv.FormatInt(int64(n), 10)
+		}
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case int:
+		return strconv.Itoa(n)
+	}
+	return strVal(v)
 }
 
 func int64FromAny(v interface{}) int64 {

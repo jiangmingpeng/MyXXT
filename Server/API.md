@@ -288,7 +288,41 @@ GET /api/sign/classmates?course_id=222&class_id=111
 }
 ```
 
-### 5.4 执行单用户签到
+### 5.4 查询活动实时状态（轻量）
+- Method: `GET`
+- Path: `/api/sign/detail`
+- Auth: 是
+- Query:
+  - `activity_id` (required)
+  - `msg` (optional)：手里这张二维码的 `c` 参数，用于让学习通回填 `sign_code`
+
+说明：
+- 只转发 `newsign/signDetail`，不补拉签到圆心，适合刷新码期间高频轮询（约 1.5s 一次）。
+- 不消耗二维码 `enc`，可在提交前判断二维码是否已失效：`if_over=true`（签到已结束）
+  或 `sign_code` 与手里的 `c` 不一致（码已刷新 / 过期），都应立刻停止重试。
+- 静态码（二维码链接里没有 `c`）拿不到可比的 `sign_code`，前端应跳过轮询。
+
+示例：
+
+```http
+GET /api/sign/detail?activity_id=987654&msg=1730000000123
+```
+
+响应体 `data`:
+
+```json
+{
+  "activity_id": 987654,
+  "start_time": 1761400000000,
+  "end_time": 1761403600000,
+  "sign_type": 2,
+  "if_refresh_ewm": true,
+  "if_over": false,
+  "sign_code": "1730000000123"
+}
+```
+
+### 5.5 执行单用户签到
 - Method: `POST`
 - Path: `/api/sign/execute`
 - Auth: 是
@@ -375,7 +409,7 @@ GET /api/sign/classmates?course_id=222&class_id=111
 - 签到码签到(`5`):
   - `sign_code` (required)
 
-### 5.5 拍照签到
+### 5.6 拍照签到
 - Method: `POST`
 - Path: `/api/sign/photo`
 - Auth: 是

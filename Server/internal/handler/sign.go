@@ -449,6 +449,44 @@ func (h *SignHandler) Check(c *gin.Context) {
 	common.Success(c, gin.H{"items": items})
 }
 
+// Detail 返回单个活动的实时详情（轻量 GET，不消耗二维码 enc）。
+//
+// 刷新码场景下前端每 1.5s 调一次，对齐参考实现的 isQRCodeExpired：
+// is_over 置位，或 sign_code 与手里二维码的 c 参数不一致，就说明这张码已失效，
+// 前端可以立刻停手换码，而不是等 stuSignajax 回来 2001 才发现。
+func (h *SignHandler) Detail(c *gin.Context) {
+	uid := common.GetUserUID(c)
+	activityID, err := strconv.ParseInt(c.Query("activity_id"), 10, 64)
+	if err != nil || activityID <= 0 {
+		common.Fail(c, 400, "invalid activity_id")
+		return
+	}
+	var user model.User
+	if err := h.db.Where("uid = ?", uid).First(&user).Error; err != nil {
+		common.Fail(c, 404, "user not found")
+		return
+	}
+	password, err := h.cc.Decrypt(user.CredentialCipher)
+	if err != nil {
+		common.Fail(c, 400, "credential expired, please login again")
+		return
+	}
+	detail, err := h.xxt.GetSignDetailLite(user.Mobile, password, activityID, c.Query("msg"))
+	if err != nil {
+		common.Fail(c, 502, err.Error())
+		return
+	}
+	common.Success(c, gin.H{
+		"activity_id":    activityID,
+		"start_time":     detail.StartTime,
+		"end_time":       detail.EndTime,
+		"sign_type":      detail.SignType,
+		"if_refresh_ewm": detail.IfRefreshEWM,
+		"if_over":        detail.IfOver,
+		"sign_code":      detail.SignCode,
+	})
+}
+
 // detailFromActivityCache 把活动缓存行还原成 SignDetail（含位置校验字段）。
 func detailFromActivityCache(cache model.SignActivity) xxt.SignDetail {
 	return xxt.SignDetail{

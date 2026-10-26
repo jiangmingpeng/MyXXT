@@ -137,6 +137,11 @@ type SignDetail struct {
 	SignType     int
 	IfRefreshEWM bool
 	IfPhoto      bool
+	// IfOver / SignCode 用于刷新码的「主动过期探测」，对齐参考实现的
+	// ChaoxingQRCodeSigner.isQRCodeExpired：前端每 1.5s 拉一次 signDetail，
+	// isOver==1 或 signCode 与手里二维码的 c 参数不一致，就说明这张码已失效。
+	IfOver   bool
+	SignCode string
 	// 位置校验相关：老师在活动里设置的签到圆心与半径。
 	// 数据来自 getPPTActiveInfo（必要时回退 signDetail）；没有位置校验时为零值。
 	IfOpenAddress     bool
@@ -657,46 +662,79 @@ func (c *Client) GetActives(mobile, password string, courseID, classID int64) ([
 	return out, nil
 }
 
-func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignDetail, error) {
+// fetchSignDetailBase 只拉 newsign/signDetail 并解析基础字段，不补拉 getPPTActiveInfo。
+// 返回的 cli/session 供 GetSignDetail 继续补拉签到圆心使用。
+//
+// msg 对齐参考实现的 isQRCodeExpired：把手里这张二维码的 c 参数一起带上，
+// 服务端会据此回填 signCode，调用方比对 signCode 是否变化即可判断二维码是否过期。
+func (c *Client) fetchSignDetailBase(mobile, password string, activityID int64, msg string) (SignDetail, *http.Client, *Session, error) {
 	s, err := c.ensureSession(mobile, password)
 	if err != nil {
-		return SignDetail{}, err
+		return SignDetail{}, nil, nil, err
 	}
 	cli := *c.clientForSession(s)
 	u := fmt.Sprintf("https://mobilelearn.chaoxing.com/newsign/signDetail?activePrimaryId=%d&type=1", activityID)
+	if msg != "" {
+		u += "&msg=" + url.QueryEscape(msg)
+	}
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	applyDeviceHeaders(req, s.UserAgent)
 	resp, err := c.doRead(context.Background(), s.Mobile, &cli, req)
 	if err != nil {
-		return SignDetail{}, err
+		return SignDetail{}, nil, nil, err
 	}
 	raw, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		return SignDetail{}, err
+		return SignDetail{}, nil, nil, err
 	}
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return SignDetail{}, err
+		return SignDetail{}, nil, nil, err
 	}
+	detail := signDetailFromPayload(payload)
+	// signDetail 本身偶尔也带定位字段，先就地解析一次。
+	applyLocationFields(&detail, payload)
+	logLocationCandidates("signDetail", activityID, payload)
+	return detail, &cli, s, nil
+}
+
+// signDetailFromPayload 解析 signDetail 的基础字段（含主动过期探测用的 isOver / signCode）。
+func signDetailFromPayload(payload map[string]interface{}) SignDetail {
 	end := parseTimeMillis(payload["endTime"])
 	if end == 0 {
 		end = 64060559999000
 	}
-	detail := SignDetail{
+	return SignDetail{
 		StartTime:    parseTimeMillis(payload["startTime"]),
 		EndTime:      end,
 		SignType:     int(int64FromAny(payload["otherId"])),
 		IfRefreshEWM: boolFromAny(payload["ifRefreshEwm"]),
 		IfPhoto:      boolFromAny(deepFindFirst(payload, "ifphoto", "ifPhoto")),
+		IfOver:       boolFromAny(deepFindFirst(payload, "isOver", "ifOver")),
+		SignCode:     codeFromAny(deepFindFirst(payload, "signCode", "sign_code")),
 	}
-	// signDetail 本身偶尔也带定位字段，先就地解析一次。
-	applyLocationFields(&detail, payload)
-	logLocationCandidates("signDetail", activityID, payload)
+}
+
+// GetSignDetailLite 供刷新码的「主动过期探测」高频调用（每 1.5s 一次）：
+// 只拉 signDetail，不补拉 getPPTActiveInfo，避免额外请求把探测延迟放大。
+func (c *Client) GetSignDetailLite(mobile, password string, activityID int64, msg string) (SignDetail, error) {
+	detail, _, _, err := c.fetchSignDetailBase(mobile, password, activityID, msg)
+	if err != nil {
+		return SignDetail{}, err
+	}
+	return detail, nil
+}
+
+func (c *Client) GetSignDetail(mobile, password string, activityID int64) (SignDetail, error) {
+	detail, cli, s, err := c.fetchSignDetailBase(mobile, password, activityID, "")
+	if err != nil {
+		return SignDetail{}, err
+	}
 	// 二维码签到 / 位置签到的距离校验要用到老师设置的签到圆心与半径，
 	// signDetail 多数情况下不返回，需要再拉一次 getPPTActiveInfo。
 	if detail.SignType == SignQRCode || detail.SignType == SignLocation {
-		if info, err := c.fetchActiveInfo(&cli, s, activityID); err != nil {
+		if info, err := c.fetchActiveInfo(cli, s, activityID); err != nil {
 			log.Printf("[activeInfo] activity=%d err=%v", activityID, err)
 		} else {
 			applyLocationFields(&detail, info)
